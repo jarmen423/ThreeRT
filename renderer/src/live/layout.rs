@@ -90,6 +90,7 @@ pub(super) const RESOURCES: &[(&str, Res)] = &[
     ("light_rw", Res::KernelReports),
     ("light_lists", Res::KernelLists),
     ("lock_fwd", Res::Own(Count::Pixels(1))),
+    ("dof_buf", Res::Own(Count::Pixels(1))),
 ];
 
 /// The grid a pass runs over, in invocations (workgroups of 8 x 8).
@@ -101,6 +102,8 @@ pub(super) enum Grid {
     PrevTraced,
     /// The output grid.
     Output,
+    /// Half of it each way (known-future: the half-resolution depth of field).
+    Half,
     /// A quarter of it each way.
     Quarter,
     /// Its 16 x 16 tiles.
@@ -132,6 +135,16 @@ pub(super) const PASSES: &[(&str, Grid)] = &[
     ("reject", Grid::Traced),
     ("upscale", Grid::Output),
     ("dof_tiles", Grid::Tiles16),
+    ("dof_dil_h", Grid::Tiles16),
+    ("dof_dil_v", Grid::Tiles16),
+    ("dof_down", Grid::Half),
+    ("dof_mip1", Grid::Half),
+    ("dof_mip2", Grid::Half),
+    ("dof_mip3", Grid::Half),
+    ("dof_mip4", Grid::Half),
+    ("dof_mip5", Grid::Half),
+    ("dof_mip6", Grid::Half),
+    ("dof_gather", Grid::Half),
     ("dof", Grid::Output),
     ("mblur", Grid::Output),
     ("lum_down", Grid::Quarter),
@@ -174,6 +187,7 @@ impl Grid {
             Grid::Traced => traced,
             Grid::PrevTraced => (prev.0.max(1), prev.1.max(1)),
             Grid::Output => out,
+            Grid::Half => (out.0.div_ceil(2), out.1.div_ceil(2)),
             Grid::Quarter => (out.0.div_ceil(4), out.1.div_ceil(4)),
             Grid::Tiles16 => (out.0.div_ceil(16), out.1.div_ceil(16)),
             Grid::LightTiles => (light_tiles(traced.0) * 8, light_tiles(traced.1) * 8),

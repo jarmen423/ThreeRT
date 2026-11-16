@@ -111,6 +111,9 @@ struct LiveParams {
 // both are ranges of one buffer, which a pass uses one way), and the tiles' lists it writes.
 @group(0) @binding(28) var<storage, read_write> light_rw: array<vec4<f32>>;
 @group(0) @binding(29) var<storage, read_write> light_lists: array<vec4<f32>>;
+// known-future: the half-resolution depth of field (L.dof.w = 1): the upscaled image at half resolution and its mip
+// levels (rgb, signed CoC in output px), then the gathered result at half resolution (rgb, foreground cover).
+@group(0) @binding(30) var<storage, read_write> dof_buf: array<vec4<f32>>;
 
 // Element i of this frame's half of a lasting buffer, and of the previous frame's.
 fn this_half(i: u32) -> u32 { return L.state.x * L.size.x * L.size.y + i; }
@@ -1804,6 +1807,168 @@ fn dof_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
     lumq[gid.y * tw + gid.x] = m;
 }
 
+// ---- known-future: depth of field at half resolution (L.dof.w = 1). The full-resolution gather below takes 48 point
+// samples of a disk up to 96 px across at 4K: 12.8 ms a frame on an L40S, and its large out-of-focus areas a stipple
+// of the samples' per-pixel rotation. Here the gather runs at half resolution and each of its taps reads a mip level
+// whose texels are as large as the spacing between taps, so a tap is the mean of the area it stands for (no stipple),
+// and a final pass blends the sharp full-resolution image with it by the pixel's own CoC.
+const DOF_LEVELS: u32 = 7u;   // half, 1/4 .. 1/128 of the output
+const DOF_TAPS: i32 = 40;
+
+fn dof_dim(k: u32) -> vec2<u32> {
+    let s = 1u << (k + 1u);
+    return vec2<u32>((L.size.x + s - 1u) / s, (L.size.y + s - 1u) / s);
+}
+fn dof_off(k: u32) -> u32 {
+    var o = 0u;
+    for (var j = 0u; j < k; j++) { let d = dof_dim(j); o += d.x * d.y; }
+    return o;
+}
+// Level k bilinear at p (its pixel units, centres at +0.5); section `off`, of level k's size.
+fn dof_bilinear(off: u32, k: u32, p: vec2<f32>) -> vec4<f32> {
+    let d = dof_dim(k);
+    let q = p - 0.5;
+    let f = floor(q);
+    let t = q - f;
+    let x0 = u32(clamp(i32(f.x), 0, i32(d.x) - 1));
+    let x1 = u32(clamp(i32(f.x) + 1, 0, i32(d.x) - 1));
+    let y0 = u32(clamp(i32(f.y), 0, i32(d.y) - 1));
+    let y1 = u32(clamp(i32(f.y) + 1, 0, i32(d.y) - 1));
+    let a = mix(dof_buf[off + y0 * d.x + x0], dof_buf[off + y0 * d.x + x1], t.x);
+    let b = mix(dof_buf[off + y1 * d.x + x0], dof_buf[off + y1 * d.x + x1], t.x);
+    return mix(a, b, t.y);
+}
+fn dof_half_on() -> bool { return L.dof.x > 0.0 && L.dof.w > 0.5; }
+
+// The upscaled image (sb: rgb, signed CoC) to half resolution, the mean of each 2 x 2.
+@compute @workgroup_size(8, 8, 1)
+fn dof_down(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = dof_dim(0u);
+    if (gid.x >= d.x || gid.y >= d.y || !dof_half_on()) { return; }
+    var c = vec4<f32>(0.0);
+    var n = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        let x = 2u * gid.x + (k & 1u);
+        let y = 2u * gid.y + (k >> 1u);
+        if (x < L.size.x && y < L.size.y) {
+            c += sb[y * L.size.x + x];
+            n += 1.0;
+        }
+    }
+    dof_buf[gid.y * d.x + gid.x] = c / max(n, 1.0);
+}
+
+fn dof_mip(gid: vec3<u32>, k: u32) {
+    let d = dof_dim(k);
+    if (gid.x >= d.x || gid.y >= d.y || !dof_half_on()) { return; }
+    let s = dof_dim(k - 1u);
+    let so = dof_off(k - 1u);
+    var c = vec4<f32>(0.0);
+    for (var j = 0u; j < 4u; j++) {
+        let x = min(2u * gid.x + (j & 1u), s.x - 1u);
+        let y = min(2u * gid.y + (j >> 1u), s.y - 1u);
+        c += dof_buf[so + y * s.x + x];
+    }
+    dof_buf[dof_off(k) + gid.y * d.x + gid.x] = c * 0.25;
+}
+@compute @workgroup_size(8, 8, 1) fn dof_mip1(@builtin(global_invocation_id) gid: vec3<u32>) { dof_mip(gid, 1u); }
+@compute @workgroup_size(8, 8, 1) fn dof_mip2(@builtin(global_invocation_id) gid: vec3<u32>) { dof_mip(gid, 2u); }
+@compute @workgroup_size(8, 8, 1) fn dof_mip3(@builtin(global_invocation_id) gid: vec3<u32>) { dof_mip(gid, 3u); }
+@compute @workgroup_size(8, 8, 1) fn dof_mip4(@builtin(global_invocation_id) gid: vec3<u32>) { dof_mip(gid, 4u); }
+@compute @workgroup_size(8, 8, 1) fn dof_mip5(@builtin(global_invocation_id) gid: vec3<u32>) { dof_mip(gid, 5u); }
+@compute @workgroup_size(8, 8, 1) fn dof_mip6(@builtin(global_invocation_id) gid: vec3<u32>) { dof_mip(gid, 6u); }
+
+// The tiles' largest CoC (`dof_tiles`, lumq) spread over every tile it can reach (L.dof.z, the largest radius, in
+// tiles each way), as a separable max: rows into lumb, then columns into lumq after the tiles (`dof_tile_reach`).
+fn dof_tiles_n() -> vec2<u32> { return vec2<u32>((L.size.x + DOF_TILE - 1u) / DOF_TILE, (L.size.y + DOF_TILE - 1u) / DOF_TILE); }
+@compute @workgroup_size(8, 8, 1)
+fn dof_dil_h(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = dof_tiles_n();
+    if (gid.x >= t.x || gid.y >= t.y || !dof_half_on()) { return; }
+    let rr = i32(ceil(L.dof.z / f32(DOF_TILE))) + 1;
+    var m = 0.0;
+    for (var k = -rr; k <= rr; k++) {
+        let x = i32(gid.x) + k;
+        if (x < 0 || x >= i32(t.x)) { continue; }
+        m = max(m, lumq[gid.y * t.x + u32(x)]);
+    }
+    lumb[gid.y * t.x + gid.x] = m;
+}
+@compute @workgroup_size(8, 8, 1)
+fn dof_dil_v(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = dof_tiles_n();
+    if (gid.x >= t.x || gid.y >= t.y || !dof_half_on()) { return; }
+    let rr = i32(ceil(L.dof.z / f32(DOF_TILE))) + 1;
+    var m = 0.0;
+    for (var k = -rr; k <= rr; k++) {
+        let y = i32(gid.y) + k;
+        if (y < 0 || y >= i32(t.y)) { continue; }
+        m = max(m, lumb[u32(y) * t.x + gid.x]);
+    }
+    lumq[t.x * t.y + gid.y * t.x + gid.x] = m;
+}
+fn dof_tile_reach(hx: u32, hy: u32) -> f32 {
+    let t = dof_tiles_n();
+    let tx = min(hx * 2u / DOF_TILE, t.x - 1u);
+    let ty = min(hy * 2u / DOF_TILE, t.y - 1u);
+    return lumq[t.x * t.y + ty * t.x + tx];
+}
+
+// The gather at half resolution: the full-resolution pass's model (each sample spreads over its own CoC disk; what
+// is in front forms a layer over the rest; what is behind counts only as far as this pixel's own CoC reaches), its
+// taps read at the mip level of their spacing. Which of two is in front: their signed CoC (it grows with depth).
+@compute @workgroup_size(8, 8, 1)
+fn dof_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d0 = dof_dim(0u);
+    if (gid.x >= d0.x || gid.y >= d0.y || !dof_half_on()) { return; }
+    let i = gid.y * d0.x + gid.x;
+    let center = dof_buf[i];
+    let ci = abs(center.w);
+    let r = max(ci, dof_tile_reach(gid.x, gid.y));
+    var outv = center.rgb;
+    var cover = 0.0;
+    if (r >= 1.0) {
+        let pi = 3.14159265;
+        let n = f32(DOF_TAPS);
+        let area = pi * r * r / n; // output px each tap stands for
+        // tap spacing in half-res px -> the level whose texel is that wide (level k: 2^k half-res px)
+        let lvl = u32(clamp(floor(log2(max(0.5 * r * sqrt(pi / n), 1.0))), 0.0, f32(DOF_LEVELS - 1u)));
+        let lsc = 1.0 / f32(1u << lvl);
+        let loff = dof_off(lvl);
+        let rot = 6.2831853 * fract(52.9829189 * fract(0.06711056 * f32(gid.x) + 0.00583715 * f32(gid.y)));
+        var bw = 1.0 / (pi * max(ci * ci, 0.25));
+        var bg = center.rgb * bw;
+        var fg = vec3<f32>(0.0);
+        var fw = 0.0;
+        let pc = vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5;
+        let tol = 1.0 + 0.05 * ci;
+        for (var k = 0; k < DOF_TAPS; k++) {
+            let a = f32(k) * 2.39996323 + rot; // Vogel disk
+            let off = 0.5 * r * sqrt((f32(k) + 0.5) / n) * vec2<f32>(cos(a), sin(a)); // half-res px
+            let q = pc + off;
+            if (q.x < 0.0 || q.y < 0.0 || q.x >= f32(d0.x) || q.y >= f32(d0.y)) { continue; }
+            let sj = dof_bilinear(loff, lvl, q * lsc);
+            let cj = abs(sj.w);
+            let dd = 2.0 * length(off); // output px
+            let front = clamp((center.w - sj.w) / tol, 0.0, 1.0);
+            let wf = front * clamp(cj - dd + 0.5, 0.0, 1.0) * area / (pi * max(cj * cj, 0.25));
+            let rb = min(cj, ci);
+            let wb = (1.0 - front) * clamp(rb - dd + 0.5, 0.0, 1.0) * area / (pi * max(rb * rb, 0.25));
+            fg += sj.rgb * wf;
+            fw += wf;
+            bg += sj.rgb * wb;
+            bw += wb;
+        }
+        outv = bg / bw;
+        if (fw > 1e-6) {
+            cover = clamp(fw, 0.0, 1.0);
+            outv = mix(outv, fg / fw, cover);
+        }
+        if (non_finite(outv)) { outv = center.rgb; cover = 0.0; }
+    }
+    dof_buf[dof_off(DOF_LEVELS) + i] = vec4<f32>(outv, cover);
+}
+
 // Depth of field on the upscaled HDR image (sb -> fa, or fb when motion blur follows), before motion blur as in UE.
 // Scatter as gather over the largest CoC around: each pixel spreads its colour over its own CoC disk. Samples in front
 // of this pixel form a foreground layer over the rest, its coverage from their spread; samples behind count only as
@@ -1816,6 +1981,15 @@ fn dof(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * w + gid.x;
     let center = sb[i];
     let ci = abs(center.w);
+    if (dof_half_on()) {
+        // known-future: the half-resolution gather (`dof_gather`), bilinear, over the sharp image where this pixel's
+        // own CoC passes a pixel or a blurred foreground covers it.
+        let b = dof_bilinear(dof_off(DOF_LEVELS), 0u, (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) * 0.5);
+        var o = mix(center.rgb, b.rgb, max(smoothstep(0.5, 2.0, ci), b.w));
+        if (non_finite(o)) { o = center.rgb; }
+        if (L.misc2.z > 0.0) { fb[i] = vec4<f32>(o, 0.0); } else { fa[i] = vec4<f32>(o, 0.0); }
+        return;
+    }
     let tw = (w + DOF_TILE - 1u) / DOF_TILE;
     let th = (h + DOF_TILE - 1u) / DOF_TILE;
     let tx = i32(gid.x / DOF_TILE);

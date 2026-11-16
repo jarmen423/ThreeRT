@@ -456,7 +456,12 @@ fn dof_params(dof: Option<&crate::desc::Dof>, tan_half_fov: f32, w: u32, h: u32)
     let sensor_h = d.sensor_width / aspect;
     let f = 0.5 * sensor_h / tan_half_fov;
     let diameter = f * f / (d.f_stop * (d.focus_distance * 1000.0 - f).max(1e-3));
-    [diameter * 0.5 / sensor_h / aspect * w as f32, d.focus_distance, 0.025 * w as f32, 0.0]
+    // known-future: THREERT_KF_DOF=half runs the half-resolution gather (live.wgsl `dof_gather`, w = 1), whose cost
+    // does not grow with the radius, and THREERT_KF_DOF_MAX sets the largest radius as a share of the width (Cycles has
+    // none: a 70 mm lens at f/2.2 focused at 0.32 m blurs the background over a 1,100 px disk at 4K).
+    let half = std::env::var("THREERT_KF_DOF").is_ok_and(|v| v == "half");
+    let max_share = std::env::var("THREERT_KF_DOF_MAX").ok().and_then(|v| v.parse::<f32>().ok()).filter(|_| half).unwrap_or(0.025);
+    [diameter * 0.5 / sensor_h / aspect * w as f32, d.focus_distance, max_share * w as f32, if half { 1.0 } else { 0.0 }]
 }
 
 /// Light LOD (`emitter_lod`): emitters within this distance of the camera keep their sampling weight, farther ones
