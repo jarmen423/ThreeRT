@@ -1949,6 +1949,28 @@ impl Gpu {
     /// their rects of the texture pages (gutters and mip chain made as `texpack::pack` makes them), so a texture that
     /// changes every frame (a laptop screen playing a video) costs one upload, not a rebuild. The image is resized to
     /// the packed size if it differs.
+    /// known-future: mip chains built elsewhere (`texpack::chains_for`, on the decode thread), written at their textures'
+    /// rects; only the upload is left to the caller's thread.
+    pub fn write_texture_chains(&self, chains: &[(String, Vec<image::RgbaImage>)]) -> usize {
+        let guard = self.page_tex.lock().unwrap();
+        let Some(p) = guard.as_ref() else { return 0 };
+        let mut n = 0;
+        for (key, chain) in chains {
+            let Some(i) = p.keys.iter().position(|k| k == key) else { continue };
+            let [layer, px, py, ..] = p.place[i];
+            for (lvl, im) in chain.iter().enumerate() {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &p.tex, mip_level: lvl as u32, origin: wgpu::Origin3d { x: px >> lvl, y: py >> lvl, z: layer }, aspect: wgpu::TextureAspect::All },
+                    im.as_raw(),
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(im.width() * 4), rows_per_image: Some(im.height()) },
+                    wgpu::Extent3d { width: im.width(), height: im.height(), depth_or_array_layers: 1 },
+                );
+            }
+            n += 1;
+        }
+        n
+    }
+
     pub fn replace_texture(&self, key: &str, img: &image::RgbaImage) -> Result<usize> {
         let guard = self.page_tex.lock().unwrap();
         let p = guard.as_ref().ok_or_else(|| anyhow!("no texture pages yet"))?;
@@ -2005,6 +2027,7 @@ impl Gpu {
             }
         }
         let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        *crate::texpack::registry().lock().unwrap() = scene.textures.iter().zip(&packed.place).map(|(t, p)| (t.key.clone(), *p, t.wrap)).collect();
         *self.page_tex.lock().unwrap() = Some(PageTex {
             keys: scene.textures.iter().map(|t| t.key.clone()).collect(),
             wrap: scene.textures.iter().map(|t| t.wrap).collect(),

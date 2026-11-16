@@ -130,6 +130,25 @@ pub fn pack(textures: &[Texture]) -> Packed {
     Packed { side, layers: pages.into_par_iter().map(mip_chain).collect(), info, place }
 }
 
+/// known-future: where each texture of the current pages sits (key, layer + padded rect + content size, wrap), so a
+/// texture command's decode thread can build the padded rect and mip chain off the render thread.
+pub fn registry() -> &'static std::sync::Mutex<Vec<(String, [u32; 7], bool)>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Vec<(String, [u32; 7], bool)>>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// known-future: the mip chains a texture's new image needs, one per texture whose key contains `key`.
+pub fn chains_for(key: &str, img: &image::RgbaImage) -> Vec<(String, Vec<image::RgbaImage>)> {
+    let reg = registry().lock().unwrap().clone();
+    reg.iter()
+        .filter(|(k, _, _)| k.contains(key))
+        .map(|(k, p, wrap)| {
+            let src = if img.dimensions() != (p[5], p[6]) { std::borrow::Cow::Owned(resize_triangle(img, p[5], p[6])) } else { std::borrow::Cow::Borrowed(img) };
+            (k.clone(), padded_chain(&src, p[3], p[4], *wrap))
+        })
+        .collect()
+}
+
 /// known-future: one texture's padded rect (`pw` x `ph`, the content `GUTTER` texels in, gutters wrapped or clamped as
 /// `pack` fills them) and its mip chain, as the pages hold them (rects are `ALIGN`ed, so each level is its own).
 pub fn padded_chain(img: &image::RgbaImage, pw: u32, ph: u32, wrap: bool) -> Vec<image::RgbaImage> {

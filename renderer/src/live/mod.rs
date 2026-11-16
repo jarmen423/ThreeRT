@@ -223,7 +223,7 @@ pub enum Cmd {
     View { cam: Camera, dof: Option<crate::desc::Dof>, ev100: Option<f32> },
     /// known-future: new pixels for a texture, in place (`Gpu::replace_texture`): key substring and the image, decoded
     /// by the stdin reader (ahead of the frames, off the render thread).
-    Texture { key: String, img: mpsc::Receiver<Option<image::RgbaImage>> },
+    Texture { key: String, img: mpsc::Receiver<Option<(image::RgbaImage, Vec<(String, Vec<image::RgbaImage>)>)>> },
     /// known-future: the emission (rgb nits) of the materials whose emission at load was `matched` (within 1e-3
     /// relative), in place: a glTF screen or bulb whose strength changes every frame, without a material function.
     Emissive { matched: [f32; 3], rgb: [f32; 3] },

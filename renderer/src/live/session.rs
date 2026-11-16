@@ -111,11 +111,12 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                 Cmd::View { cam, dof, ev100 } => core.set_view(cam, dof, ev100),
                 Cmd::Texture { key, img } => {
                     let t = Instant::now();
-                    let Some(img) = img.recv().ok().flatten() else {
+                    let Some((img, chains)) = img.recv().ok().flatten() else {
                         eprintln!("live: texture {key}: the image could not be read");
                         continue;
                     };
-                    match core.g.replace_texture(&key, &img) {
+                    let done = if chains.is_empty() { core.g.replace_texture(&key, &img) } else { Ok(core.g.write_texture_chains(&chains)) };
+                    match done {
                         Ok(n) => {
                             if std::env::var("THREERT_KF_VERBOSE").is_ok() {
                                 eprintln!("live: texture {key} x{n} in {:.2} ms", t.elapsed().as_secs_f64() * 1e3)
@@ -336,6 +337,7 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
             let path = PathBuf::from(v["path"].as_str()?);
             let (w, h) = (v["w"].as_u64().unwrap_or(0) as u32, v["h"].as_u64().unwrap_or(0) as u32);
             let mask = v["mask"].as_str().map(PathBuf::from);
+            let key = v["key"].as_str()?.to_string();
             let (tx, rx) = mpsc::channel();
             rayon::spawn(move || {
                 let mut img = if path.extension().is_some_and(|e| e == "rgba") {
@@ -354,9 +356,14 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
                         }
                     }
                 }
-                let _ = tx.send(img);
+                // the padded rects and mip chains here too, off the render thread (pages known: the registry)
+                let key2 = key.clone();
+                let _ = tx.send(img.map(|im| {
+                    let chains = crate::texpack::chains_for(&key2, &im);
+                    (im, chains)
+                }));
             });
-            Cmd::Texture { key: v["key"].as_str()?.to_string(), img: rx }
+            Cmd::Texture { key, img: rx }
         }
         "camera" => Cmd::Camera(Camera::look_at(vec("pos")?, vec("target")?, v["tan"].as_f64().unwrap_or(0.0) as f32)),
         "frames" => Cmd::Step {
