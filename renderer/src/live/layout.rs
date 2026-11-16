@@ -91,6 +91,7 @@ pub(super) const RESOURCES: &[(&str, Res)] = &[
     ("light_lists", Res::KernelLists),
     ("lock_fwd", Res::Own(Count::Pixels(1))),
     ("dof_buf", Res::Own(Count::Pixels(1))),
+    ("dof_k", Res::Own(Count::Pixels(1))),
 ];
 
 /// The grid a pass runs over, in invocations (workgroups of 8 x 8).

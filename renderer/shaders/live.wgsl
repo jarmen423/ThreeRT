@@ -114,6 +114,9 @@ struct LiveParams {
 // known-future: the half-resolution depth of field (L.dof.w = 1): the upscaled image at half resolution and its mip
 // levels (rgb, signed CoC in output px), then the gathered result at half resolution (rgb, foreground cover).
 @group(0) @binding(30) var<storage, read_write> dof_buf: array<vec4<f32>>;
+// known-future: per traced sample, the signed CoC its light is blurred at (`compose`; `upscale` reads it): on a near
+// mirror the reflection is focused at its optical distance, as a lens (Cycles) focuses it, not at the glass.
+@group(0) @binding(31) var<storage, read_write> dof_k: array<f32>;
 
 // Element i of this frame's half of a lasting buffer, and of the previous frame's.
 fn this_half(i: u32) -> u32 { return L.state.x * L.size.x * L.size.y + i; }
@@ -990,6 +993,19 @@ fn compose(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let shown = finite_or_zero(max(c, vec3<f32>(0.0)));
     fb[q] = vec4<f32>(shown, t);
+    if (dof_half_on()) {
+        // known-future: the CoC of what this sample shows. Off a near mirror (the screen's glass) most of what is seen
+        // can be the reflection, whose image lies at the surface's distance plus the reflection's (`refl`'s resolved
+        // hit distance), as far behind the glass: it is blurred by that depth in the share of the light it brings.
+        var k = dof_coc(depth);
+        let rt = refl_res[q].w;
+        if (t > 0.0 && px.emit.w < NEAR_MIRROR && rt > 0.0) {
+            let sc = spec_load(1u, q).rgb * medium_tr(q);
+            let share = clamp(lum(sc) / max(lum(shown), 1e-6), 0.0, 1.0);
+            k = mix(k, dof_coc((t + rt) * dot(dir, L.cur.fwd.xyz)), share);
+        }
+        dof_k[q] = k;
+    }
     // (None on animated shading: it shows this frame's picture, and its history is not kept for it to stand by.)
     let reactive = max(select(0.0, 1.0, px.albedo.w > 1.5), clamp(medium_share(q) / UP_MEDIUM, 0.0, 1.0));
     sample_vel[q] = vec4<f32>(vel, depth, reactive);
@@ -1528,7 +1544,14 @@ fn upscale(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ks = L.isz.x * L.isz.y;
     if (arrayLength(&direct_in) >= ks + w * h) { shown += finite_or_zero(max(direct_in[ks + i].rgb, vec3<f32>(0.0))); }
     // The image: into fa, or into sb for depth of field / motion blur to read (w: the CoC of the nearest sample's depth).
-    let img = vec4<f32>(shown, dof_coc(sample_vel[u32(bc.y * iw + bc.x)].z));
+    var coc = dof_coc(sample_vel[u32(bc.y * iw + bc.x)].z);
+    if (dof_half_on()) {
+        // known-future: the traced light's CoC (`compose`: a reflection's at its optical distance), and the sharp
+        // emission's, the surface's own, by their shares of the pixel.
+        let es = clamp(lum(shown - lin) / max(lum(shown), 1e-6), 0.0, 1.0);
+        coc = mix(dof_k[u32(bc.y * iw + bc.x)], coc, es);
+    }
+    let img = vec4<f32>(shown, coc);
     if (L.misc2.z > 0.0 || L.dof.x > 0.0) { sb[i] = img; } else { fa[i] = img; }
 }
 
