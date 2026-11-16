@@ -998,7 +998,8 @@ fn compose(@builtin(global_invocation_id) gid: vec3<u32>) {
         // can be the reflection, whose image lies at the surface's distance plus the reflection's (`refl`'s resolved
         // hit distance), as far behind the glass: it is blurred by that depth in the share of the light it brings.
         var k = dof_coc(depth);
-        let rt = refl_res[q].w;
+        // (A coated surface's reflections skip the resolve: then the sample's own specular hit distance, 1e4 for sky.)
+        let rt = select(px.spec.w, refl_res[q].w, refl_res[q].w > 0.0);
         if (t > 0.0 && px.emit.w < NEAR_MIRROR && rt > 0.0) {
             let sc = spec_load(1u, q).rgb * medium_tr(q);
             let share = clamp(lum(sc) / max(lum(shown), 1e-6), 0.0, 1.0);
@@ -2008,7 +2009,8 @@ fn dof(@builtin(global_invocation_id) gid: vec3<u32>) {
         // known-future: the half-resolution gather (`dof_gather`), bilinear, over the sharp image where this pixel's
         // own CoC passes a pixel or a blurred foreground covers it.
         let b = dof_bilinear(dof_off(DOF_LEVELS), 0u, (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) * 0.5);
-        var o = mix(center.rgb, b.rgb, max(smoothstep(0.5, 2.0, ci), b.w));
+        // (Below a 1.5 px CoC the sharp image as it is: the half-resolution gather softens in-focus text.)
+        var o = mix(center.rgb, b.rgb, max(smoothstep(1.5, 4.0, ci), b.w));
         if (non_finite(o)) { o = center.rgb; }
         if (L.misc2.z > 0.0) { fb[i] = vec4<f32>(o, 0.0); } else { fa[i] = vec4<f32>(o, 0.0); }
         return;
