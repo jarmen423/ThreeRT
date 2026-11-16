@@ -532,7 +532,15 @@ impl LiveCore {
             br2: [r[4], r[5], 0.0, 0.0],
             bt: [t[0], t[1], t[2], t[3]],
             bt2: [t[4], t[5], 0.0, 0.0],
-            dof: dof_params(self.sc.dof.as_ref(), cam.tan_half_fov, w, h),
+            dof: {
+                // known-future: a view that asks for the full-resolution gather has UE's (2.5 % largest radius, w = 0)
+                let mut d = dof_params(self.sc.dof.as_ref(), cam.tan_half_fov, w, h);
+                if self.kf_dof_half == Some(false) && d[0] > 0.0 {
+                    d[2] = 0.025 * w as f32;
+                    d[3] = 0.0;
+                }
+                d
+            },
             jit: [jitter.0, jitter.1, 0.0, 0.0],
             state: [1 - self.frame % 2, 0, 0, 0],
             lt: [tile_at.0, tile_at.1, 0, layout::light_tiles(iw)],

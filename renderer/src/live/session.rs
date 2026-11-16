@@ -106,7 +106,12 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                         eprintln!("live: host messages failed: {e:#}");
                     }
                 }
-                Cmd::View { cam, dof, ev100 } => core.set_view(cam, dof, ev100),
+                Cmd::View { cam, dof, ev100, dof_half } => {
+                    core.set_view(cam, dof, ev100);
+                    if dof_half.is_some() {
+                        core.kf_dof_half = dof_half;
+                    }
+                }
                 Cmd::Texture { key, img } => {
                     let t = Instant::now();
                     let Some((img, chains)) = img.recv().ok().flatten() else {
@@ -335,7 +340,7 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
                 f_stop: a[1].as_f64().unwrap_or(0.0) as f32,
                 sensor_width: a[2].as_f64().unwrap_or(0.0) as f32,
             });
-            Cmd::View { cam: Camera { pos: vec("pos")?, fwd, up: right.cross(fwd), right, tan_half_fov: v["tan"].as_f64().unwrap_or(0.0) as f32 }, dof, ev100: v["ev100"].as_f64().map(|e| e as f32) }
+            Cmd::View { cam: Camera { pos: vec("pos")?, fwd, up: right.cross(fwd), right, tan_half_fov: v["tan"].as_f64().unwrap_or(0.0) as f32 }, dof, ev100: v["ev100"].as_f64().map(|e| e as f32), dof_half: v["dof_half"].as_bool() }
         }
         "emissive" => {
             let f3 = |k: &str| v[k].as_array().filter(|a| a.len() == 3).map(|a| [a[0].as_f64().unwrap_or(0.0) as f32, a[1].as_f64().unwrap_or(0.0) as f32, a[2].as_f64().unwrap_or(0.0) as f32]);
