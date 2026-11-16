@@ -1951,13 +1951,12 @@ fn dof_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     var outv = center.rgb;
     var cover = 0.0;
     if (r >= 1.0) {
+        // Two rings: within this pixel's own CoC (what lies behind it, and what in front reaches it there), at the
+        // level of that ring's tap spacing; and, where the largest CoC around reaches further, the rest of that disk
+        // for what in front spreads this far, at its own coarser level. (One ring over the largest CoC read every
+        // pixel at its coarsest level: where a near foreground blurs 700 px, 128 px blocks over the sharp keys.)
         let pi = 3.14159265;
         let n = f32(DOF_TAPS);
-        let area = pi * r * r / n; // output px each tap stands for
-        // tap spacing in half-res px -> the level whose texel is that wide (level k: 2^k half-res px)
-        let lvl = u32(clamp(floor(log2(max(0.5 * r * sqrt(pi / n), 1.0))), 0.0, f32(DOF_LEVELS - 1u)));
-        let lsc = 1.0 / f32(1u << lvl);
-        let loff = dof_off(lvl);
         let rot = 6.2831853 * fract(52.9829189 * fract(0.06711056 * f32(gid.x) + 0.00583715 * f32(gid.y)));
         var bw = 1.0 / (pi * max(ci * ci, 0.25));
         var bg = center.rgb * bw;
@@ -1965,22 +1964,33 @@ fn dof_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
         var fw = 0.0;
         let pc = vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5;
         let tol = 1.0 + 0.05 * ci;
-        for (var k = 0; k < DOF_TAPS; k++) {
-            let a = f32(k) * 2.39996323 + rot; // Vogel disk
-            let off = 0.5 * r * sqrt((f32(k) + 0.5) / n) * vec2<f32>(cos(a), sin(a)); // half-res px
-            let q = pc + off;
-            if (q.x < 0.0 || q.y < 0.0 || q.x >= f32(d0.x) || q.y >= f32(d0.y)) { continue; }
-            let sj = dof_bilinear(loff, lvl, q * lsc);
-            let cj = abs(sj.w);
-            let dd = 2.0 * length(off); // output px
-            let front = clamp((center.w - sj.w) / tol, 0.0, 1.0);
-            let wf = front * clamp(cj - dd + 0.5, 0.0, 1.0) * area / (pi * max(cj * cj, 0.25));
-            let rb = min(cj, ci);
-            let wb = (1.0 - front) * clamp(rb - dd + 0.5, 0.0, 1.0) * area / (pi * max(rb * rb, 0.25));
-            fg += sj.rgb * wf;
-            fw += wf;
-            bg += sj.rgb * wb;
-            bw += wb;
+        for (var ring = 0; ring < 2; ring++) {
+            let r0 = select(0.0, ci, ring == 1);
+            let r1 = select(max(ci, 1.0), r, ring == 1);
+            if (ring == 1 && r1 <= r0 * 1.25 + 1.0) { break; }
+            let area = pi * (r1 * r1 - r0 * r0) / n; // output px each tap stands for
+            let lvl = u32(clamp(floor(log2(max(0.5 * sqrt(area), 1.0))), 0.0, f32(DOF_LEVELS - 1u)));
+            let lsc = 1.0 / f32(1u << lvl);
+            let loff = dof_off(lvl);
+            for (var k = 0; k < DOF_TAPS; k++) {
+                let a = f32(k) * 2.39996323 + rot; // Vogel disk, over the annulus r0 .. r1
+                let rr = sqrt(r0 * r0 + (r1 * r1 - r0 * r0) * (f32(k) + 0.5) / n);
+                let off = 0.5 * rr * vec2<f32>(cos(a), sin(a)); // half-res px
+                let q = pc + off;
+                if (q.x < 0.0 || q.y < 0.0 || q.x >= f32(d0.x) || q.y >= f32(d0.y)) { continue; }
+                let sj = dof_bilinear(loff, lvl, q * lsc);
+                let cj = abs(sj.w);
+                let front = clamp((center.w - sj.w) / tol, 0.0, 1.0);
+                let wf = front * clamp(cj - rr + 0.5, 0.0, 1.0) * area / (pi * max(cj * cj, 0.25));
+                fg += sj.rgb * wf;
+                fw += wf;
+                if (ring == 0) {
+                    let rb = min(cj, ci);
+                    let wb = (1.0 - front) * clamp(rb - rr + 0.5, 0.0, 1.0) * area / (pi * max(rb * rb, 0.25));
+                    bg += sj.rgb * wb;
+                    bw += wb;
+                }
+            }
         }
         outv = bg / bw;
         if (fw > 1e-6) {
