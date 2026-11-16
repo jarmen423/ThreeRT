@@ -520,7 +520,8 @@ impl LiveCore {
             // misc2.z: motion blur, this frame's motion (pixels) -> blur length. UE (PostProcessMotionBlur.cpp,
             // UpdateMotionBlurTimeScale) blurs over +- amount / 2 x the motion x (1 / target FPS) / frame time, the
             // actual frame time without a target. 0 while nothing moves (the pass then costs nothing).
-            misc2: [1.0, SAMPLE_CEILING, if !blur { 0.0 } else if self.blur.1 > 0.0 { self.blur.0 / (self.blur.1 * self.frame_dt.clamp(1.0 / 240.0, 0.25)) } else { self.blur.0 }, spp.max(1) as f32],
+            // known-future THREERT_KF_NO_CLAMP=1: no firefly clamp (a test of what it cuts)
+            misc2: [1.0, if std::env::var("THREERT_KF_NO_CLAMP").is_ok_and(|v| v == "1") { 1.0e30 } else { SAMPLE_CEILING }, if !blur { 0.0 } else if self.blur.1 > 0.0 { self.blur.0 / (self.blur.1 * self.frame_dt.clamp(1.0 / 240.0, 0.25)) } else { self.blur.0 }, spp.max(1) as f32],
             mode: [self.view_mode, 0, self.live_lighting() as u32, 0],
             post: self.post,
             ae: self.sc.exposure_settings.ae,

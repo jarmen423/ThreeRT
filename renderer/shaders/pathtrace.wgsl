@@ -1871,6 +1871,8 @@ fn local_lights(s: Surface, lb: Lobes, v: vec3<f32>, o: vec3<f32>, x: vec3<f32>,
                 let reach = li.color.w + select(li.dir.w, length(li.ext.xyz) + li.dir.w, u32(li.pos.w) == 3u);
                 if (li.color.w > 0.0 && dot(dc, dc) > reach * reach) { continue; }
                 if (u32(li.pos.w) != 3u && dot(dc, s.ng) < -li.dir.w) { continue; } // eval_bsdf rejects it anyway
+                // known-future: drawn exactly by `kf_sharp` on this surface
+                if (s.kf_sharp && kf_sharp_on() && kf_point_blank(li, x, s.ng)) { continue; }
                 let ls = local_light(li, x, rng2(rng_sub(rd, i)));
                 if (all(ls.c <= vec3<f32>(0.0))) { continue; }
                 let f = eval_bsdf_k(s, lb, v, ls.l, li.x.y);
@@ -3437,9 +3439,50 @@ fn kf_sharp(@builtin(global_invocation_id) gid: vec3<u32>) {
             let lod = mesh_lod(a, m) + log2(max(width, 1e-7)) - 0.5 * log2(max(abs(dot(ng, d)), 1e-3)) + KF_SHARP_LOD;
             e = emission(m, mesh_uv(a, m, hit.u, hit.v), lod) * obj_power(a);
             if (non_finite(e)) { e = vec3<f32>(0.0); }
+            // The rect lights right in front of the surface (`kf_point_blank`), which the trace leaves out here: their
+            // exact unshadowed irradiance (Lambert's polygon formula) on the surface's diffuse, under its coat.
+            let x = o + d * hit.t;
+            let n = select(-ng, ng, dot(ng, d) < 0.0);
+            let base = m.base_color.rgb * (1.0 - m.params.x);
+            let coat = select(0.0, clamp(m.layer.z, 0.0, 1.0), has(F_COAT));
+            let through = (1.0 - 0.04 * coat) * (1.0 - 0.04 * coat);
+            for (var i = P.counts2.x; i < P.counts.x; i++) {
+                let li = light_at(i);
+                if (!kf_point_blank(li, x, n)) { continue; }
+                e += base / PI * kf_rect_irradiance(li, x, n) * li.color.rgb * through;
+            }
+            if (non_finite(e)) { e = vec3<f32>(0.0); }
         }
     }
     direct_store(P.size.x * P.size.y + gid.y * ow + gid.x, vec4<f32>(e, 0.0));
+}
+
+// known-future: a rect light within KF_POINT_BLANK of a MAT_KF_SHARP surface, facing it (his `screen_glow`, 4 mm in front
+// of the laptop's glass): light sampling of a large light that near is all variance (a few huge samples, which the
+// clamps cut), and its irradiance there is a closed form. `kf_sharp` draws it; the trace leaves it out on that surface.
+const KF_POINT_BLANK: f32 = 0.02;
+fn kf_point_blank(li: Light, x: vec3<f32>, n: vec3<f32>) -> bool {
+    if (u32(li.pos.w) != 3u || all(li.color.rgb <= vec3<f32>(0.0))) { return false; }
+    let h = dot(x - li.pos.xyz, li.dir.xyz); // in front of the light, along its emission
+    return h > 0.0 && h < KF_POINT_BLANK && dot(li.dir.xyz, n) < 0.0;
+}
+// Irradiance / radiance at x (normal n) from a rect light, unshadowed: (1/2) sum over its edges of the angle they span
+// times the cosine of their plane with n.
+fn kf_rect_irradiance(li: Light, x: vec3<f32>, n: vec3<f32>) -> f32 {
+    let ux = li.ext.xyz;
+    let uy = normalize(cross(li.dir.xyz, ux)) * li.dir.w;
+    let c = li.pos.xyz;
+    var p = array<vec3<f32>, 4>(c - ux - uy, c + ux - uy, c + ux + uy, c - ux + uy);
+    var sum = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        let a = normalize(p[k] - x);
+        let b = normalize(p[(k + 1u) % 4u] - x);
+        let cr = cross(a, b);
+        let l = length(cr);
+        if (l < 1e-9) { continue; }
+        sum += acos(clamp(dot(a, b), -1.0, 1.0)) * dot(cr / l, n);
+    }
+    return 0.5 * abs(sum);
 }
 
 // Mip bias of `kf_sharp`'s texture lookups (0: the pixel's footprint; Cycles' pixel filter is a little wider).
