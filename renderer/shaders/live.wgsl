@@ -998,7 +998,8 @@ fn compose(@builtin(global_invocation_id) gid: vec3<u32>) {
         // can be the reflection, whose image lies at the surface's distance plus the reflection's (`refl`'s resolved
         // hit distance), as far behind the glass: it is blurred by that depth in the share of the light it brings.
         var k = dof_coc(depth);
-        let rt = refl_res[q].w;
+        // (A coated surface's reflections skip the resolve: then the sample's own specular hit distance, 1e4 for sky.)
+        let rt = select(px.spec.w, refl_res[q].w, refl_res[q].w > 0.0);
         if (t > 0.0 && px.emit.w < NEAR_MIRROR && rt > 0.0) {
             let sc = spec_load(1u, q).rgb * medium_tr(q);
             let share = clamp(lum(sc) / max(lum(shown), 1e-6), 0.0, 1.0);
