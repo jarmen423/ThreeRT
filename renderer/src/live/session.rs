@@ -339,6 +339,7 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
             let mask = v["mask"].as_str().map(PathBuf::from);
             let key = v["key"].as_str()?.to_string();
             let (tx, rx) = mpsc::channel();
+            let key2 = key.clone();
             rayon::spawn(move || {
                 let mut img = if path.extension().is_some_and(|e| e == "rgba") {
                     std::fs::read(&path).ok().and_then(|b| image::RgbaImage::from_raw(w, h, b))
@@ -357,7 +358,6 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
                     }
                 }
                 // the padded rects and mip chains here too, off the render thread (pages known: the registry)
-                let key2 = key.clone();
                 let _ = tx.send(img.map(|im| {
                     let chains = crate::texpack::chains_for(&key2, &im);
                     (im, chains)
