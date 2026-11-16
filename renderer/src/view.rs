@@ -500,7 +500,7 @@ fn frame(s: &mut State, cmds: &mpsc::Receiver<Cmd>, services: &mut dyn HostServi
             Cmd::Snapshot(p, _, _) => s.snapshot = Some(p),
             Cmd::Sync(..) | Cmd::Lockstep(_) => {}
             // (known-future's film commands: the headless runner's.)
-            Cmd::View { .. } | Cmd::Texture { .. } => {}
+            Cmd::View { .. } | Cmd::Texture { .. } | Cmd::Emissive { .. } => {}
             Cmd::Step { cam, snapshot, .. } => {
                 if let Some(c) = cam {
                     s.orbit = Orbit::from_camera(&c);

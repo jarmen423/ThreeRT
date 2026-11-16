@@ -224,6 +224,9 @@ pub enum Cmd {
     /// known-future: new pixels for a texture, in place (`Gpu::replace_texture`): key substring and the image, decoded
     /// by the stdin reader (ahead of the frames, off the render thread).
     Texture { key: String, img: mpsc::Receiver<Option<image::RgbaImage>> },
+    /// known-future: the emission (rgb nits) of the materials whose emission at load was `matched` (within 1e-3
+    /// relative), in place: a glTF screen or bulb whose strength changes every frame, without a material function.
+    Emissive { matched: [f32; 3], rgb: [f32; 3] },
     /// Drop all accumulated history (benchmarks measure convergence from here).
     Reset,
     /// Set the scene time, s (benchmarks: with lockstep, frame k from here renders at t + k x its frame time; frame
@@ -388,6 +391,8 @@ pub struct LiveCore {
     pub guard_trips: Option<u32>,
     /// Its readback: the buffer and its state (0 free, 1 mapping, 2 mapped), as the frame timer's.
     guard_read: Option<(wgpu::Buffer, Arc<AtomicU32>)>,
+    /// known-future: material indices found for `set_emissive`, by the emission they were matched on.
+    kf_emissive: std::collections::HashMap<String, Vec<usize>>,
 }
 
 
@@ -552,7 +557,7 @@ impl LiveCore {
         // brings it, `gpu::loop_guard_of`.)
         let guard_read = (gpu::loop_guard_of(!g.hwrt).is_some() && targets.kernel.guard.is_some())
             .then(|| (g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("loop guard read"), size: 4, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), Arc::new(AtomicU32::new(0))));
-        let mut core = LiveCore { particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false,  pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, sky_cover: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read };
+        let mut core = LiveCore { particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false,  pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, sky_cover: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read, kf_emissive: Default::default() };
         core.spark_lights = core.sc.tables.emitter_tris.iter().any(|e| e.nominal);
         core.sky_cover = core.sc.tables.cloud_cover;
         core.apply_post(&pp);
@@ -709,6 +714,28 @@ impl LiveCore {
 
     /// known-future: the view of a film frame (`Cmd::View`): camera, depth of field and manual exposure, set in place
     /// (the scene's camera must have a manual exposure: `apply_exposure`'s rule).
+    pub fn set_emissive(&mut self, matched: [f32; 3], rgb: [f32; 3]) -> usize {
+        let key = format!("{matched:?}");
+        if !self.kf_emissive.contains_key(&key) {
+            let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * a.abs().max(b.abs()).max(1e-6);
+            let ids: Vec<usize> = (0..self.sc.tables.materials.len())
+                .filter(|&i| { let e = self.sc.tables.materials[i].emissive; (0..3).all(|c| close(e[c], matched[c])) })
+                .collect();
+            self.kf_emissive.insert(key.clone(), ids);
+        }
+        let ids = self.kf_emissive[&key].clone();
+        for &i in &ids {
+            self.sc.tables.materials[i].emissive = [rgb[0], rgb[1], rgb[2], self.sc.tables.materials[i].emissive[3]];
+        }
+        if !ids.is_empty() {
+            self.upload_materials();
+            self.add_material_emitters();
+            self.write_emitters();
+            self.lit_changed = self.frame.max(1);
+        }
+        ids.len()
+    }
+
     pub fn set_view(&mut self, c: Camera, dof: Option<crate::desc::Dof>, ev100: Option<f32>) {
         self.set_camera(c);
         self.sc.dof = dof;

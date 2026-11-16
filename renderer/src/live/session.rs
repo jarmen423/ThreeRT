@@ -124,6 +124,11 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                         Err(e) => eprintln!("live: texture {key}: {e:#}"),
                     }
                 }
+                Cmd::Emissive { matched, rgb } => {
+                    if core.set_emissive(matched, rgb) == 0 {
+                        eprintln!("live: emissive {matched:?}: no material emits that");
+                    }
+                }
                 Cmd::SppCap(n) => lock_spp = n.max(1),
                 Cmd::Status(_) => {}
                 Cmd::Quit => {
@@ -320,19 +325,35 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
             });
             Cmd::View { cam: Camera { pos: vec("pos")?, fwd, up: right.cross(fwd), right, tan_half_fov: v["tan"].as_f64().unwrap_or(0.0) as f32 }, dof, ev100: v["ev100"].as_f64().map(|e| e as f32) }
         }
+        "emissive" => {
+            let f3 = |k: &str| v[k].as_array().filter(|a| a.len() == 3).map(|a| [a[0].as_f64().unwrap_or(0.0) as f32, a[1].as_f64().unwrap_or(0.0) as f32, a[2].as_f64().unwrap_or(0.0) as f32]);
+            Cmd::Emissive { matched: f3("match")?, rgb: f3("rgb")? }
+        }
         "texture" => {
             // Decoded on rayon's pool as the command arrives, ahead of the frames and in parallel (a film's screen is a
             // 4-megapixel PNG a frame): raw RGBA8 (`.rgba`, with w and h) or any image file. The frame that uses it
             // waits for it in order.
             let path = PathBuf::from(v["path"].as_str()?);
             let (w, h) = (v["w"].as_u64().unwrap_or(0) as u32, v["h"].as_u64().unwrap_or(0) as u32);
+            let mask = v["mask"].as_str().map(PathBuf::from);
             let (tx, rx) = mpsc::channel();
             rayon::spawn(move || {
-                let img = if path.extension().is_some_and(|e| e == "rgba") {
+                let mut img = if path.extension().is_some_and(|e| e == "rgba") {
                     std::fs::read(&path).ok().and_then(|b| image::RgbaImage::from_raw(w, h, b))
                 } else {
                     image::open(&path).ok().map(|i| i.to_rgba8())
                 };
+                // known-future: a mask multiplied in (his screen: image x mask), red channel, same size
+                if let (Some(im), Some(m)) = (img.as_mut(), mask.as_ref().and_then(|m| kf_mask(m))) {
+                    if m.dimensions() == im.dimensions() {
+                        for (p, q) in im.pixels_mut().zip(m.pixels()) {
+                            let k = q[0] as u32;
+                            for c in 0..3 {
+                                p[c] = ((p[c] as u32 * k + 127) / 255) as u8;
+                            }
+                        }
+                    }
+                }
                 let _ = tx.send(img);
             });
             Cmd::Texture { key: v["key"].as_str()?.to_string(), img: rx }
@@ -464,4 +485,16 @@ impl Stream {
         eprintln!("live: stream closed (read-back {:.1} ms in all)", self.read_ms);
         Ok(())
     }
+}
+
+/// known-future: a texture mask, decoded once (the screen's corner and notch mask).
+fn kf_mask(p: &std::path::Path) -> Option<Arc<image::RgbaImage>> {
+    static MASKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<image::RgbaImage>>>> = std::sync::OnceLock::new();
+    let m = MASKS.get_or_init(Default::default);
+    if let Some(i) = m.lock().unwrap().get(p) {
+        return Some(i.clone());
+    }
+    let i = Arc::new(image::open(p).ok()?.to_rgba8());
+    m.lock().unwrap().insert(p.to_path_buf(), i.clone());
+    Some(i)
 }
