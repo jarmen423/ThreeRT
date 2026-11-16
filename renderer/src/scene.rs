@@ -932,6 +932,9 @@ pub fn card_material(color: [f32; 3], intensity: f32) -> GpuMaterial {
         tex0: [-1; 4],
         tex1: [-1, -1, MAT_EMITTER_CARD, 0],
         uv: [1.0, 1.0, 0.0, 0.0],
+        // known-future THREERT_KF_CARDS_HIDDEN=1: an alpha cutoff, so every ray but the camera's takes the card
+        // (pathtrace.wgsl `alpha_pass`): Cycles' area light with visible_camera off and visible_glossy on.
+        uv2: [0.0, 0.0, 0.0, if std::env::var("THREERT_KF_CARDS_HIDDEN").is_ok_and(|v| v == "1") { 0.5 } else { 0.0 }],
         ..Default::default()
     }
 }

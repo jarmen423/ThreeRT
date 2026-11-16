@@ -1165,6 +1165,10 @@ var<private> lights_only: bool = false;
 fn alpha_pass(ti: u32, inst: u32, u: f32, v: f32, t: f32) -> bool {
     let a = attrs[ti];
     let m = material_at(bitcast<u32>(a.uv.w));
+    // known-future (THREERT_KF_CARDS_HIDDEN): a rect light's card with an alpha cutoff is seen by every ray but the
+    // camera's (Cycles' visible_camera off, visible_glossy on: a window light the camera looks through but a screen's
+    // glass reflects).
+    if (m.tex1.z == MAT_EMITTER_CARD) { return cur_depth > 0u; }
     var alpha = m.base_color.a;
     var lod = mesh_lod(a, m) + log2(max(t * 2.0 * P.cam_pos.w / lod_height(), 1e-7)) - LOD_BIAS;
     if (has(F_INST) && inst != NO_INST) { lod += bitcast<f32>(instance_at(inst).info.z); }
