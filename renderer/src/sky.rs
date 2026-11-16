@@ -482,6 +482,13 @@ pub fn bake_gradient(g: &Gradient, width: u32, height: u32) -> SkyBake {
             let theta = y / height as f32 * PI;
             let phi = (x / width as f32 - 0.5) * 2.0 * PI;
             let d = Vec3::new(theta.sin() * phi.sin(), theta.cos(), -theta.sin() * phi.cos());
+            if let Some(e) = g.horizon_exponent.filter(|e| *e < 0.0) {
+                // known-future: Blender's world in "The Edge": mix(horizon, zenith, clamp((z + 0.05) / 0.6)), Blender's z
+                // being our y; -1: z of Incoming (Cycles sets wi = -D, so -d.y), -2: z of the ray direction (+d.y).
+                let t = (((if e > -1.5 { -d.y } else { d.y }) + 0.05) / 0.6).clamp(0.0, 1.0);
+                let c = g.horizon.lerp(g.zenith, t);
+                return [c.x, c.y, c.z, 1.0];
+            }
             if let Some(exp) = g.horizon_exponent {
                 // UE M_NightSky, evaluated on the whole sphere.
                 let h = d.y;

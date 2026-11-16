@@ -585,6 +585,26 @@ impl LiveCore {
             self.sc.dof = c.dof.clone();
             self.cam = self.sc.scene_camera;
         }
+        // known-future: a gradient sky's new values, baked now (lockstep frames stay exact) into the environment map.
+        if changes.sky_gradient {
+            if let crate::desc::Sky::Gradient { zenith, horizon, ground, intensity, horizon_exponent, glow, .. } = &world.environment.sky {
+                let gr = crate::sky::Gradient {
+                    zenith: glam::Vec3::from(*zenith) * *intensity,
+                    horizon: glam::Vec3::from(*horizon) * *intensity,
+                    ground: glam::Vec3::from(*ground) * *intensity,
+                    horizon_exponent: *horizon_exponent,
+                    glow: glow.as_ref().map(|g| (glam::Vec3::from(g.color) * g.intensity * *intensity, g.height.max(1e-3), g.width.map(|w| (w, g.power.unwrap_or(6.0))))),
+                    clouds: None,
+                    cloud_map: None,
+                };
+                let size = self.sc.up.env_tex.size();
+                let b = crate::sky::bake_gradient(&gr, size.width, size.height);
+                let env = gpu::EnvMap { width: b.width, height: b.height, texels: b.texels };
+                let cdf = crate::build_env_cdf(&env);
+                self.g.write_env(&self.sc.up, &env, &cdf);
+                self.lit_changed = self.frame.max(1);
+            }
+        }
         // Lighting changed: for 45 frames the histories hold HISTORY_LIVE frames at most (`live_lighting`), and where the
         // change is strong the temporal pass cuts the history locally (anti-lag).
         if d.materials || d.lights || d.objects || d.environment {

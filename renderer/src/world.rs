@@ -287,6 +287,8 @@ pub struct Changes {
     /// Objects whose per-instance data changed.
     pub customs: HashSet<u32>,
     pub environment: bool,
+    /// known-future: only a gradient sky's values changed: re-baked in place.
+    pub sky_gradient: bool,
     pub camera: bool,
     /// The atmosphere's sun moved (time of day): the live view rewrites its light and re-bakes the sky in place.
     pub sun: bool,
@@ -962,12 +964,18 @@ impl World {
 
     pub fn set_environment(&mut self, e: desc::Environment) {
         let sky_same = format!("{:?}", self.environment.sky) == format!("{:?}", e.sky);
+        // known-future: a gradient sky whose values change (a time-lapse: colours and strength every frame) is re-baked in
+        // place (live/edits.rs `commit`), not rebuilt; clouds keep the rebuild.
+        let gradient_values = matches!((&self.environment.sky, &e.sky), (desc::Sky::Gradient { clouds: None, .. }, desc::Sky::Gradient { clouds: None, .. }));
         let fog_shape = |f: &Option<desc::Fog>| f.as_ref().map(|f| (f.volumetric.is_some(), f.density > 0.0));
         // (A background appearing or going is a kernel feature, F_BACKGROUND: a rebuild; a new colour is not.)
-        if !sky_same || fog_shape(&self.environment.fog) != fog_shape(&e.fog) || self.environment.background.is_some() != e.background.is_some() {
+        if (!sky_same && !gradient_values) || fog_shape(&self.environment.fog) != fog_shape(&e.fog) || self.environment.background.is_some() != e.background.is_some() {
             self.changes.structural = true;
         } else {
             self.changes.environment = true;
+            if !sky_same {
+                self.changes.sky_gradient = true;
+            }
         }
         self.environment = e;
     }
