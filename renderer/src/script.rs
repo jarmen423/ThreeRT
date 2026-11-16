@@ -85,7 +85,11 @@ pub enum GameCode<'a> {
 
 /// Time budgets per entry point (ms): building a scene may take a while, events and frames may not.
 const SETUP_MS: u64 = 120_000;
-const EVENT_MS: u64 = 1_000;
+const EVENT_MS_DEFAULT: u64 = 1_000;
+/// known-future: THREERT_EVENT_MS lends an event more time (a film's first event of a shot sets every node and light).
+fn event_ms() -> u64 {
+    std::env::var("THREERT_EVENT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(EVENT_MS_DEFAULT)
+}
 const FRAME_MS: u64 = 50;
 
 /// The host channel's queue (`__host_post`): the most messages it holds until the app takes them (a session nobody
@@ -610,7 +614,7 @@ impl ScriptHost {
         }
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64);
         let list = serde_json::Value::Array(messages.to_vec()).to_string();
-        self.call(EVENT_MS, |ctx| match host(ctx)?.get::<_, Option<Function>>("hostMessages")? {
+        self.call(event_ms(), |ctx| match host(ctx)?.get::<_, Option<Function>>("hostMessages")? {
             Some(f) => f.call((list, ts)),
             None => Ok(()),
         })
@@ -646,7 +650,7 @@ impl ScriptHost {
     pub fn event(&self, kind: &str, payload: &serde_json::Value) -> Result<EventOut> {
         let t = Instant::now();
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_millis() as f64);
-        let (json, rejections) = self.enter(EVENT_MS, |ctx| host(ctx)?.get::<_, Function>("event")?.call::<_, String>((kind, payload.to_string(), ts)));
+        let (json, rejections) = self.enter(event_ms(), |ctx| host(ctx)?.get::<_, Function>("event")?.call::<_, String>((kind, payload.to_string(), ts)));
         let json = match json {
             Ok(json) => json,
             Err(e) => {
@@ -665,17 +669,17 @@ impl ScriptHost {
 
     /// State writes another authority (the room) committed.
     pub fn commit(&self, writes: &serde_json::Value, seq: i64) -> Result<()> {
-        self.call_host::<()>(EVENT_MS, "commit", (writes.to_string(), seq))
+        self.call_host::<()>(event_ms(), "commit", (writes.to_string(), seq))
     }
 
     /// Replaces the game state (a render of a room's current state).
     pub fn set_state(&self, state: &serde_json::Value, seq: i64) -> Result<()> {
-        self.call_host::<()>(EVENT_MS, "setState", (state.to_string(), seq))
+        self.call_host::<()>(event_ms(), "setState", (state.to_string(), seq))
     }
 
     /// The committed game state and its sequence number.
     pub fn state(&self) -> Result<(serde_json::Value, i64)> {
-        let s: String = self.call_host(EVENT_MS, "state", ())?;
+        let s: String = self.call_host(event_ms(), "state", ())?;
         let v: serde_json::Value = serde_json::from_str(&s)?;
         Ok((v["state"].clone(), v["seq"].as_i64().unwrap_or(0)))
     }
@@ -710,17 +714,17 @@ impl ScriptHost {
 
     /// The live scene's objects (editor outliner), JSON.
     pub fn outline(&self) -> Result<String> {
-        self.call_host(EVENT_MS, "outline", ())
+        self.call_host(event_ms(), "outline", ())
     }
 
     /// One object's editable properties, JSON.
     pub fn inspect(&self, name: &str) -> Result<String> {
-        self.call_host(EVENT_MS, "inspect", (name,))
+        self.call_host(event_ms(), "inspect", (name,))
     }
 
     /// Edits one property of a live object (`value` JSON).
     pub fn edit(&self, name: &str, prop: &str, value: &serde_json::Value) -> Result<()> {
-        self.call_host::<()>(EVENT_MS, "edit", (name, prop, value.to_string()))
+        self.call_host::<()>(event_ms(), "edit", (name, prop, value.to_string()))
     }
 }
 
