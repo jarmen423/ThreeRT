@@ -1947,23 +1947,18 @@ impl Gpu {
 
     /// known-future: new pixels for the textures whose key contains `key` (glTF: `<uri>#img<n>`), written in place into
     /// their rects of the texture pages (gutters and mip chain made as `texpack::pack` makes them), so a texture that
-    /// changes every frame (a laptop screen playing a video) costs one upload, not a rebuild. `path`: raw RGBA8
-    /// (`.rgba`, `w` x `h`) or any image file. The image is resized to the packed size if it differs.
-    pub fn replace_texture(&self, key: &str, path: &std::path::Path, w: u32, h: u32) -> Result<usize> {
+    /// changes every frame (a laptop screen playing a video) costs one upload, not a rebuild. The image is resized to
+    /// the packed size if it differs.
+    pub fn replace_texture(&self, key: &str, img: &image::RgbaImage) -> Result<usize> {
         let guard = self.page_tex.lock().unwrap();
         let p = guard.as_ref().ok_or_else(|| anyhow!("no texture pages yet"))?;
         let ids: Vec<usize> = (0..p.keys.len()).filter(|&i| p.keys[i].contains(key)).collect();
         if ids.is_empty() {
             return Err(anyhow!("no texture whose key contains {key:?} (keys: {:?})", p.keys));
         }
-        let img = if path.extension().is_some_and(|e| e == "rgba") {
-            image::RgbaImage::from_raw(w, h, std::fs::read(path)?).ok_or_else(|| anyhow!("{}: not {w} x {h} RGBA8", path.display()))?
-        } else {
-            image::open(path)?.to_rgba8()
-        };
         for &i in &ids {
             let [layer, px, py, pw, ph, cw, chh] = p.place[i];
-            let src = if img.dimensions() != (cw, chh) { std::borrow::Cow::Owned(crate::texpack::resize_triangle(&img, cw, chh)) } else { std::borrow::Cow::Borrowed(&img) };
+            let src = if img.dimensions() != (cw, chh) { std::borrow::Cow::Owned(crate::texpack::resize_triangle(img, cw, chh)) } else { std::borrow::Cow::Borrowed(img) };
             for (lvl, im) in crate::texpack::padded_chain(&src, pw, ph, p.wrap[i]).iter().enumerate() {
                 self.queue.write_texture(
                     wgpu::TexelCopyTextureInfo { texture: &p.tex, mip_level: lvl as u32, origin: wgpu::Origin3d { x: px >> lvl, y: py >> lvl, z: layer }, aspect: wgpu::TextureAspect::All },

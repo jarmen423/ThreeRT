@@ -108,9 +108,9 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                     }
                 }
                 Cmd::View { cam, dof, ev100 } => core.set_view(cam, dof, ev100),
-                Cmd::Texture { key, path, w: tw, h: th } => {
+                Cmd::Texture { key, img } => {
                     let t = Instant::now();
-                    match core.g.replace_texture(&key, &path, tw, th) {
+                    match core.g.replace_texture(&key, &img) {
                         Ok(n) => {
                             if std::env::var("THREERT_KF_VERBOSE").is_ok() {
                                 eprintln!("live: texture {key} x{n} in {:.2} ms", t.elapsed().as_secs_f64() * 1e3)
@@ -312,7 +312,23 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
             });
             Cmd::View { cam: Camera { pos: vec("pos")?, fwd, up: right.cross(fwd), right, tan_half_fov: v["tan"].as_f64().unwrap_or(0.0) as f32 }, dof, ev100: v["ev100"].as_f64().map(|e| e as f32) }
         }
-        "texture" => Cmd::Texture { key: v["key"].as_str()?.to_string(), path: PathBuf::from(v["path"].as_str()?), w: v["w"].as_u64().unwrap_or(0) as u32, h: v["h"].as_u64().unwrap_or(0) as u32 },
+        "texture" => {
+            // Decoded here, on the stdin reader's thread: raw RGBA8 (`.rgba`, with w and h) or any image file.
+            let path = PathBuf::from(v["path"].as_str()?);
+            let (w, h) = (v["w"].as_u64().unwrap_or(0) as u32, v["h"].as_u64().unwrap_or(0) as u32);
+            let img = if path.extension().is_some_and(|e| e == "rgba") {
+                std::fs::read(&path).ok().and_then(|b| image::RgbaImage::from_raw(w, h, b))
+            } else {
+                image::open(&path).ok().map(|i| i.to_rgba8())
+            };
+            match img {
+                Some(img) => Cmd::Texture { key: v["key"].as_str()?.to_string(), img: Arc::new(img) },
+                None => {
+                    eprintln!("live: texture {}: cannot read it", path.display());
+                    return None;
+                }
+            }
+        }
         "camera" => Cmd::Camera(Camera::look_at(vec("pos")?, vec("target")?, v["tan"].as_f64().unwrap_or(0.0) as f32)),
         "frames" => Cmd::Step {
             cam: None,

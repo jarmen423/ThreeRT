@@ -221,8 +221,9 @@ pub enum Cmd {
     /// known-future film driver: a frame's view as numbers (camera basis with roll, tan of half the vertical field of
     /// view, depth of field or none, manual exposure), in place: no rebuild for a lens or focus that changes every frame.
     View { cam: Camera, dof: Option<crate::desc::Dof>, ev100: Option<f32> },
-    /// known-future: new pixels for a texture, in place (`Gpu::replace_texture`): key substring, file, raw size.
-    Texture { key: String, path: PathBuf, w: u32, h: u32 },
+    /// known-future: new pixels for a texture, in place (`Gpu::replace_texture`): key substring and the image, decoded
+    /// by the stdin reader (ahead of the frames, off the render thread).
+    Texture { key: String, img: Arc<image::RgbaImage> },
     /// Drop all accumulated history (benchmarks measure convergence from here).
     Reset,
     /// Set the scene time, s (benchmarks: with lockstep, frame k from here renders at t + k x its frame time; frame
