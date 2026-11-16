@@ -654,7 +654,10 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
             let bake = match last.as_ref() {
                 Some((k, b)) if k == gr => b.clone(),
                 _ => {
-                    let b = std::sync::Arc::new(sky::bake_gradient(gr, 1024, 512));
+                    // known-future: Blender's linear ramp (horizonExponent < 0) is smooth: 256 x 128 holds it, and a film
+                    // re-bakes it every frame (live/edits.rs), so 16x fewer texels to bake and to build the CDF of.
+                    let (bw, bh) = if gr.horizon_exponent.is_some_and(|e| e < 0.0) { (256, 128) } else { (1024, 512) };
+                    let b = std::sync::Arc::new(sky::bake_gradient(gr, bw, bh));
                     *last = Some((gr.clone(), b.clone()));
                     b
                 }
