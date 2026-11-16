@@ -223,7 +223,7 @@ pub enum Cmd {
     View { cam: Camera, dof: Option<crate::desc::Dof>, ev100: Option<f32> },
     /// known-future: new pixels for a texture, in place (`Gpu::replace_texture`): key substring and the image, decoded
     /// by the stdin reader (ahead of the frames, off the render thread).
-    Texture { key: String, img: Arc<image::RgbaImage> },
+    Texture { key: String, img: mpsc::Receiver<Option<image::RgbaImage>> },
     /// Drop all accumulated history (benchmarks measure convergence from here).
     Reset,
     /// Set the scene time, s (benchmarks: with lockstep, frame k from here renders at t + k x its frame time; frame

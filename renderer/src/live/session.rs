@@ -6,7 +6,7 @@ use super::*;
 /// Headless runner: renders at a fixed frame rate and saves snapshots on request (tools/bench-live.ts).
 pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
     let (w, h) = (opts.width, opts.height);
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Cmd>(CMD_AHEAD);
     spawn_stdin_reader(cmd_tx);
     let (mut game, mut core) = crate::script::GameSession::start(&opts.bundle, &opts.room, &opts.assets, gpu::Gpu::new()?, presets, w, h)?;
     // The host channel: this runner is the app. How the game was opened, once after setup; what the game posts goes
@@ -57,7 +57,8 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                 Err(_) => return Ok(()),
             }
         }
-        cmds.extend(std::iter::from_fn(|| cmd_rx.try_recv().ok()));
+        let room = CMD_AHEAD.saturating_sub(cmds.len());
+        cmds.extend(std::iter::from_fn(|| cmd_rx.try_recv().ok()).take(room));
         while let Some(c) = if lockstep.is_some() && budget > 0 { None } else { cmds.pop_front() } {
             match c {
                 Cmd::Camera(c) => core.set_camera(c),
@@ -110,6 +111,10 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                 Cmd::View { cam, dof, ev100 } => core.set_view(cam, dof, ev100),
                 Cmd::Texture { key, img } => {
                     let t = Instant::now();
+                    let Some(img) = img.recv().ok().flatten() else {
+                        eprintln!("live: texture {key}: the image could not be read");
+                        continue;
+                    };
                     match core.g.replace_texture(&key, &img) {
                         Ok(n) => {
                             if std::env::var("THREERT_KF_VERBOSE").is_ok() {
@@ -278,7 +283,10 @@ pub fn save_bgra(path: &Path, px: &[u8], w: u32, h: u32) {
     }
 }
 
-fn spawn_stdin_reader(cmd_tx: mpsc::Sender<Cmd>) {
+/// Commands read ahead of the frames at most (the reader then waits): a film driver sends about four a frame.
+const CMD_AHEAD: usize = 96;
+
+fn spawn_stdin_reader(cmd_tx: mpsc::SyncSender<Cmd>) {
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -313,21 +321,21 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
             Cmd::View { cam: Camera { pos: vec("pos")?, fwd, up: right.cross(fwd), right, tan_half_fov: v["tan"].as_f64().unwrap_or(0.0) as f32 }, dof, ev100: v["ev100"].as_f64().map(|e| e as f32) }
         }
         "texture" => {
-            // Decoded here, on the stdin reader's thread: raw RGBA8 (`.rgba`, with w and h) or any image file.
+            // Decoded on rayon's pool as the command arrives, ahead of the frames and in parallel (a film's screen is a
+            // 4-megapixel PNG a frame): raw RGBA8 (`.rgba`, with w and h) or any image file. The frame that uses it
+            // waits for it in order.
             let path = PathBuf::from(v["path"].as_str()?);
             let (w, h) = (v["w"].as_u64().unwrap_or(0) as u32, v["h"].as_u64().unwrap_or(0) as u32);
-            let img = if path.extension().is_some_and(|e| e == "rgba") {
-                std::fs::read(&path).ok().and_then(|b| image::RgbaImage::from_raw(w, h, b))
-            } else {
-                image::open(&path).ok().map(|i| i.to_rgba8())
-            };
-            match img {
-                Some(img) => Cmd::Texture { key: v["key"].as_str()?.to_string(), img: Arc::new(img) },
-                None => {
-                    eprintln!("live: texture {}: cannot read it", path.display());
-                    return None;
-                }
-            }
+            let (tx, rx) = mpsc::channel();
+            rayon::spawn(move || {
+                let img = if path.extension().is_some_and(|e| e == "rgba") {
+                    std::fs::read(&path).ok().and_then(|b| image::RgbaImage::from_raw(w, h, b))
+                } else {
+                    image::open(&path).ok().map(|i| i.to_rgba8())
+                };
+                let _ = tx.send(img);
+            });
+            Cmd::Texture { key: v["key"].as_str()?.to_string(), img: rx }
         }
         "camera" => Cmd::Camera(Camera::look_at(vec("pos")?, vec("target")?, v["tan"].as_f64().unwrap_or(0.0) as f32)),
         "frames" => Cmd::Step {

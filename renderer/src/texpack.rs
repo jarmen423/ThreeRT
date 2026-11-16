@@ -11,7 +11,12 @@ pub const GUTTER: u32 = 16;
 pub const MIPS: u32 = 5;
 const ALIGN: u32 = 1 << (MIPS - 1);
 const MAX_PAGE: u32 = 4096;
-const MAX_DIM: u32 = 2048;
+const MAX_DIM_DEFAULT: u32 = 2048;
+/// known-future: THREERT_MAX_TEXTURE raises the largest texture side kept as it is (a 2560-wide laptop screen that
+/// fills a 4K frame); at most a page's side.
+fn max_dim() -> u32 {
+    std::env::var("THREERT_MAX_TEXTURE").ok().and_then(|v| v.parse().ok()).map_or(MAX_DIM_DEFAULT, |v: u32| v.clamp(256, MAX_PAGE - 2 * GUTTER))
+}
 
 pub struct Packed {
     pub side: u32,
@@ -37,7 +42,7 @@ pub fn pack(textures: &[Texture]) -> Packed {
     let src: Vec<std::borrow::Cow<image::RgbaImage>> = textures
         .par_iter()
         .map(|t| {
-            let (w, h) = (t.width.min(MAX_DIM), t.height.min(MAX_DIM));
+            let (w, h) = (t.width.min(max_dim()), t.height.min(max_dim()));
             let k = (w as f32 / t.width as f32).min(h as f32 / t.height as f32);
             let (mut w, mut h) = (((t.width as f32 * k) as u32).max(1), ((t.height as f32 * k) as u32).max(1));
             if w >= 512 && w.is_power_of_two() {
