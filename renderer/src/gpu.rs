@@ -7,6 +7,15 @@ use anyhow::{anyhow, Result};
 use web_time::Instant;
 use wgpu::util::DeviceExt;
 
+/// known-future: the texture pages' texture, kept for in-place texture replacement (`Gpu::replace_texture`).
+pub struct PageTex {
+    tex: wgpu::Texture,
+    keys: Vec<String>,
+    wrap: Vec<bool>,
+    /// Per texture: layer, padded rect x, y, w, h in the page, content w, h (`texpack::Packed::place`).
+    place: Vec<[u32; 7]>,
+}
+
 pub struct Gpu {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -54,6 +63,8 @@ pub struct Gpu {
     pub hwrt: bool,
     /// Last uploaded texture pages, reused while the scene's texture set is unchanged (live edits re-upload often).
     pages: std::sync::Mutex<Option<(u64, wgpu::TextureView, std::sync::Arc<Vec<[f32; 4]>>)>>,
+    /// known-future: the texture pages' texture and where each texture sits in it, for `replace_texture`.
+    page_tex: std::sync::Mutex<Option<PageTex>>,
     /// The translucency pass (hardware RT): group 2's layout (translucent.wgsl), the kernel layout with it, and its
     /// pipelines (`translucent`, `volume_train`) by the kernel's variant key.
     tl_layout: Option<wgpu::BindGroupLayout>,
@@ -1774,7 +1785,7 @@ impl Gpu {
         } else {
             (None, None, None, None)
         };
-        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, approx, approx_default: approx, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl, tl_pipelines: Default::default(), kernel_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
+        Ok(Gpu { instance, adapter, timestamps, device, queue, adapter_info, uniform_tables, switches, approx, approx_default: approx, pipeline_cache, source: src, module, merged, modules: Default::default(), pipeline_layout: pl, pipelines: Default::default(), layout, vis_layout, no_vis, no_vis_bufs, no_vis_view, no_grid_view, grid_layout, hwrt, pages: Default::default(), page_tex: Default::default(), tl_layout, tl_pipeline_layout, tl_vis_layout, no_vis_tl, tl_pipelines: Default::default(), kernel_passes: Default::default(), proc_cache: Default::default(), proc_blases: Default::default() })
     }
 
     /// Whether this device's kernel buffers have the loop guard's count (`guard_room`; always in the merged layout).
@@ -1934,6 +1945,37 @@ impl Gpu {
         p
     }
 
+    /// known-future: new pixels for the textures whose key contains `key` (glTF: `<uri>#img<n>`), written in place into
+    /// their rects of the texture pages (gutters and mip chain made as `texpack::pack` makes them), so a texture that
+    /// changes every frame (a laptop screen playing a video) costs one upload, not a rebuild. `path`: raw RGBA8
+    /// (`.rgba`, `w` x `h`) or any image file. The image is resized to the packed size if it differs.
+    pub fn replace_texture(&self, key: &str, path: &std::path::Path, w: u32, h: u32) -> Result<usize> {
+        let guard = self.page_tex.lock().unwrap();
+        let p = guard.as_ref().ok_or_else(|| anyhow!("no texture pages yet"))?;
+        let ids: Vec<usize> = (0..p.keys.len()).filter(|&i| p.keys[i].contains(key)).collect();
+        if ids.is_empty() {
+            return Err(anyhow!("no texture whose key contains {key:?} (keys: {:?})", p.keys));
+        }
+        let img = if path.extension().is_some_and(|e| e == "rgba") {
+            image::RgbaImage::from_raw(w, h, std::fs::read(path)?).ok_or_else(|| anyhow!("{}: not {w} x {h} RGBA8", path.display()))?
+        } else {
+            image::open(path)?.to_rgba8()
+        };
+        for &i in &ids {
+            let [layer, px, py, pw, ph, cw, chh] = p.place[i];
+            let src = if img.dimensions() != (cw, chh) { std::borrow::Cow::Owned(crate::texpack::resize_triangle(&img, cw, chh)) } else { std::borrow::Cow::Borrowed(&img) };
+            for (lvl, im) in crate::texpack::padded_chain(&src, pw, ph, p.wrap[i]).iter().enumerate() {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &p.tex, mip_level: lvl as u32, origin: wgpu::Origin3d { x: px >> lvl, y: py >> lvl, z: layer }, aspect: wgpu::TextureAspect::All },
+                    im.as_raw(),
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(im.width() * 4), rows_per_image: Some(im.height()) },
+                    wgpu::Extent3d { width: im.width(), height: im.height(), depth_or_array_layers: 1 },
+                );
+            }
+        }
+        Ok(ids.len())
+    }
+
     /// Texture pages for the scene's texture set (see `texpack`), cached across uploads of the same set.
     fn texture_pages(&self, scene: &Scene, timings: &mut Vec<(String, f64)>) -> (wgpu::TextureView, std::sync::Arc<Vec<[f32; 4]>>) {
         let key = crate::texpack::set_key(&scene.textures);
@@ -1968,6 +2010,12 @@ impl Gpu {
             }
         }
         let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        *self.page_tex.lock().unwrap() = Some(PageTex {
+            keys: scene.textures.iter().map(|t| t.key.clone()).collect(),
+            wrap: scene.textures.iter().map(|t| t.wrap).collect(),
+            place: packed.place.clone(),
+            tex,
+        });
         let info = std::sync::Arc::new(packed.info);
         timings.push(("texture_pages_ms".into(), t.elapsed().as_secs_f64() * 1000.0));
         *cache = Some((key, view.clone(), info.clone()));

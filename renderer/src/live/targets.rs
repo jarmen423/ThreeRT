@@ -30,6 +30,15 @@ pub(super) const LUT: u32 = 32;
 
 /// UE-style 32^3 LUT: log-encoded linear input -> display sRGB, built from the exact CPU port of the filmic tonemapper.
 pub(super) fn tonemap_lut(p: &crate::desc::PostPreset) -> Vec<u16> {
+    // known-future: THREERT_LUT_FILE = a LUT made elsewhere (Blender's AgX view transform and look, from OCIO): LUT^3 RGBA
+    // half floats, red fastest, the same log-encoded input lattice as below and display-encoded output.
+    if let Ok(f) = std::env::var("THREERT_LUT_FILE") {
+        match std::fs::read(&f) {
+            Ok(b) if b.len() == (LUT * LUT * LUT * 4 * 2) as usize => return b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
+            Ok(b) => eprintln!("THREERT_LUT_FILE {f}: {} bytes, want {}", b.len(), LUT * LUT * LUT * 8),
+            Err(e) => eprintln!("THREERT_LUT_FILE {f}: {e}"),
+        }
+    }
     let tm = post::Tonemapper::new(p);
     let mut out = Vec::with_capacity((LUT * LUT * LUT * 4) as usize);
     let log_to_lin = |v: f32| (2f32.powf((v - 444.0 / 1023.0) * 14.0) * 0.18 - LOG_OFFSET).max(0.0);

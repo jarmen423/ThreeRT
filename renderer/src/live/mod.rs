@@ -83,6 +83,8 @@ pub struct LiveOpts {
     pub display_scale: f32,
     /// `--launch`: the `params` of the host channel's `launch` message (docs/RUNTIME.md "The host channel").
     pub launch: Option<serde_json::Value>,
+    /// known-future `--stream PATH`: every frame a step marks `emit` goes to PATH (a FIFO) as BGRA8, w x h x 4 bytes.
+    pub stream: Option<PathBuf>,
 }
 
 /// Lowest dynamic-resolution scale (UE r.DynamicRes.MinScreenPercentage default) of a view whose pixels are the
@@ -215,7 +217,12 @@ pub enum Cmd {
     Lockstep(Option<f32>),
     /// A step: an optional camera, `frames` frames to render (lockstep), and a sync answer / snapshot at the last of them,
     /// registered with the camera in one command so neither can land a frame late.
-    Step { cam: Option<Camera>, frames: u32, sync: Option<String>, snapshot: Option<PathBuf> },
+    Step { cam: Option<Camera>, frames: u32, sync: Option<String>, snapshot: Option<PathBuf>, emit: bool },
+    /// known-future film driver: a frame's view as numbers (camera basis with roll, tan of half the vertical field of
+    /// view, depth of field or none, manual exposure), in place: no rebuild for a lens or focus that changes every frame.
+    View { cam: Camera, dof: Option<crate::desc::Dof>, ev100: Option<f32> },
+    /// known-future: new pixels for a texture, in place (`Gpu::replace_texture`): key substring, file, raw size.
+    Texture { key: String, path: PathBuf, w: u32, h: u32 },
     /// Drop all accumulated history (benchmarks measure convergence from here).
     Reset,
     /// Set the scene time, s (benchmarks: with lockstep, frame k from here renders at t + k x its frame time; frame
@@ -697,6 +704,21 @@ impl LiveCore {
 
     pub fn rays(&self) -> bool {
         self.rays
+    }
+
+    /// known-future: the view of a film frame (`Cmd::View`): camera, depth of field and manual exposure, set in place
+    /// (the scene's camera must have a manual exposure: `apply_exposure`'s rule).
+    pub fn set_view(&mut self, c: Camera, dof: Option<crate::desc::Dof>, ev100: Option<f32>) {
+        self.set_camera(c);
+        self.sc.dof = dof;
+        if let Some(ev) = ev100 {
+            let e = 2f32.powf(-ev);
+            if self.sc.exposure > 0.0 {
+                self.sc.base.misc[0] *= self.sc.exposure / e;
+            }
+            self.sc.exposure = e;
+            self.sc.exposure_settings.ae2 = [e, 0.0, 0.0, 0.0];
+        }
     }
 
     pub fn set_camera(&mut self, mut c: Camera) {

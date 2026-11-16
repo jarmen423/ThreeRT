@@ -25,6 +25,11 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
     eprintln!("live: load {}", serde_json::Value::Object(core.load_timings().iter().map(|(k, v)| (k.clone(), (*v).into())).collect()));
     eprintln!("live: {}x{} @{} fps on {} ({})", w, h, opts.fps, core.g.adapter_info.name, if core.g.hwrt { "HW RT" } else { "BVH" });
     let staging = core.g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("snapshot"), size: (w * h * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    // known-future `--stream`: frames out through a ring of three read-back buffers, one frame behind the GPU, and a
+    // writer thread (the reader of the FIFO paces it); its byte buffers come back for reuse.
+    let mut stream = opts.stream.clone().map(|p| Stream::new(&core.g.device, p, (w * h * 4) as u64));
+    let mut emits: Vec<(u32, u32)> = vec![]; // core.frame ranges to stream
+    let mut lock_spp = 1u32;
     let frame_dt = Duration::from_secs_f64(1.0 / opts.fps as f64);
     let mut next = Instant::now();
     let mut snapshots: Vec<(PathBuf, u32, u32)> = vec![]; // path, min history, first eligible frame
@@ -37,17 +42,23 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
     let mut prev_start = Instant::now();
     let mut lockstep: Option<f32> = None;
     let mut budget = 0u32; // lockstep: frames the commands so far asked for and not yet rendered
+    let mut held: std::collections::VecDeque<Cmd> = Default::default(); // lockstep: commands after a step not yet rendered
     loop {
         let t_frame = Instant::now();
-        let mut cmds: Vec<Cmd> = vec![];
-        if lockstep.is_some() && budget == 0 {
+        // In lockstep the commands run in order with the frames: a step's frames render before the commands after it
+        // (known-future: a film driver sends frame k+1's view right behind frame k's step; held here until k is drawn).
+        let mut cmds: std::collections::VecDeque<Cmd> = std::mem::take(&mut held);
+        if lockstep.is_some() && budget == 0 && cmds.is_empty() {
+            if let Some(st) = &mut stream {
+                st.drain(&core.g.device, 0)?;
+            }
             match cmd_rx.recv() {
-                Ok(c) => cmds.push(c),
+                Ok(c) => cmds.push_back(c),
                 Err(_) => return Ok(()),
             }
         }
         cmds.extend(std::iter::from_fn(|| cmd_rx.try_recv().ok()));
-        for c in cmds {
+        while let Some(c) = if lockstep.is_some() && budget > 0 { None } else { cmds.pop_front() } {
             match c {
                 Cmd::Camera(c) => core.set_camera(c),
                 Cmd::Lockstep(dt) => {
@@ -55,7 +66,7 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                     core.fixed_dt = dt;
                     budget = 0;
                 }
-                Cmd::Step { cam, frames, sync, snapshot } => {
+                Cmd::Step { cam, frames, sync, snapshot, emit } => {
                     if let Some(c) = cam {
                         core.set_camera(c);
                     }
@@ -64,6 +75,9 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                         budget += n;
                     }
                     let last = core.frame + n - 1;
+                    if emit {
+                        emits.push((core.frame + budget - n, core.frame + budget - 1));
+                    }
                     if let Some(p) = snapshot {
                         snapshots.push((p, 0, last));
                     }
@@ -93,10 +107,29 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                         eprintln!("live: host messages failed: {e:#}");
                     }
                 }
-                Cmd::SppCap(_) | Cmd::Status(_) => {}
-                Cmd::Quit => return Ok(()),
+                Cmd::View { cam, dof, ev100 } => core.set_view(cam, dof, ev100),
+                Cmd::Texture { key, path, w: tw, h: th } => {
+                    let t = Instant::now();
+                    match core.g.replace_texture(&key, &path, tw, th) {
+                        Ok(n) => {
+                            if std::env::var("THREERT_KF_VERBOSE").is_ok() {
+                                eprintln!("live: texture {key} x{n} in {:.2} ms", t.elapsed().as_secs_f64() * 1e3)
+                            }
+                        }
+                        Err(e) => eprintln!("live: texture {key}: {e:#}"),
+                    }
+                }
+                Cmd::SppCap(n) => lock_spp = n.max(1),
+                Cmd::Status(_) => {}
+                Cmd::Quit => {
+                    if let Some(st) = stream.take() {
+                        st.finish(&core.g.device)?;
+                    }
+                    return Ok(());
+                }
             }
         }
+        held = cmds;
         // The frame script runs on wall-clock time (frames slower than the target rate still animate at real speed).
         if lockstep.is_some() && budget == 0 {
             emit_posts(&mut game);
@@ -118,11 +151,23 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
         }
         // Snapshot metadata is this frame's (history / spp at render time), so copy the output whenever one is pending.
         let pending = !snapshots.is_empty();
+        let fno0 = core.frame;
+        let emit_this = stream.is_some() && emits.iter().any(|&(a, b)| fno0 >= a && fno0 <= b);
+        emits.retain(|&(_, b)| b > fno0);
+        let ring = stream.as_ref().filter(|_| emit_this).map(|st| &st.ring[st.next]);
         core.render(spp, |e, out| {
             if pending {
                 e.copy_buffer_to_buffer(out, 0, &staging, 0, (w * h * 4) as u64);
             }
+            if let Some(r) = ring {
+                e.copy_buffer_to_buffer(out, 0, r, 0, (w * h * 4) as u64);
+            }
         });
+        if emit_this {
+            if let Some(st) = &mut stream {
+                st.queued(&core.g.device)?;
+            }
+        }
         game.click_shown();
         let (hist, fno) = (core.history_len as u32, core.frame);
         syncs.retain(|(id, from)| {
@@ -176,7 +221,7 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
         prev_start = t_frame;
         last_frame = Instant::now();
         core.govern_resolution(opts.fps);
-        spp = if core.render_scale < 1.0 || lockstep.is_some() { 1 } else { next_spp(spp, core.gpu_ms, opts.fps) };
+        spp = if core.render_scale < 1.0 { 1 } else if lockstep.is_some() { lock_spp } else { next_spp(spp, core.gpu_ms, opts.fps) };
         let _ = core.g.device.poll(wgpu::PollType::Poll);
         if lockstep.is_some() {
             budget -= 1;
@@ -255,13 +300,26 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
             frames: v["frames"].as_u64().unwrap_or(1) as u32,
             sync: v.get("sync").map(|s| s.as_str().map(str::to_string).unwrap_or_else(|| s.to_string())),
             snapshot: v["snapshot"].as_str().map(PathBuf::from),
+            emit: v["emit"].as_bool().unwrap_or(false),
         },
+        "view" => {
+            let (fwd, up) = (vec("fwd")?.normalize(), vec("up")?.normalize());
+            let right = fwd.cross(up).normalize();
+            let dof = v["dof"].as_array().filter(|a| a.len() == 3).map(|a| crate::desc::Dof {
+                focus_distance: a[0].as_f64().unwrap_or(0.0) as f32,
+                f_stop: a[1].as_f64().unwrap_or(0.0) as f32,
+                sensor_width: a[2].as_f64().unwrap_or(0.0) as f32,
+            });
+            Cmd::View { cam: Camera { pos: vec("pos")?, fwd, up: right.cross(fwd), right, tan_half_fov: v["tan"].as_f64().unwrap_or(0.0) as f32 }, dof, ev100: v["ev100"].as_f64().map(|e| e as f32) }
+        }
+        "texture" => Cmd::Texture { key: v["key"].as_str()?.to_string(), path: PathBuf::from(v["path"].as_str()?), w: v["w"].as_u64().unwrap_or(0) as u32, h: v["h"].as_u64().unwrap_or(0) as u32 },
         "camera" => Cmd::Camera(Camera::look_at(vec("pos")?, vec("target")?, v["tan"].as_f64().unwrap_or(0.0) as f32)),
         "frames" => Cmd::Step {
             cam: None,
             frames: v["n"].as_u64().unwrap_or(1) as u32,
             sync: v.get("sync").map(|s| s.as_str().map(str::to_string).unwrap_or_else(|| s.to_string())),
             snapshot: v["snapshot"].as_str().map(PathBuf::from),
+            emit: v["emit"].as_bool().unwrap_or(false),
         },
         "lockstep" => Cmd::Lockstep(if v["on"].as_bool().unwrap_or(true) { Some(v["dt"].as_f64().unwrap_or(1.0 / 60.0) as f32) } else { None }),
         "event" => Cmd::Event(v["type"].as_str()?.to_string(), if v["payload"].is_null() { serde_json::json!({}) } else { v["payload"].clone() }),
@@ -272,7 +330,7 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
         "time" => Cmd::Time(v["t"].as_f64()? as f32),
         "mode" => Cmd::Mode(v["mode"].as_u64()? as u32),
         "bounces" => Cmd::Bounces(v["bounces"].as_u64()?.clamp(1, 16) as u32),
-        "spp" => Cmd::SppCap(v["max"].as_u64()?.clamp(1, 16) as u32),
+        "spp" => Cmd::SppCap(v["max"].as_u64()?.clamp(1, 64) as u32),
         "scale" => Cmd::Scale(v["scale"].as_f64()? as f32),
         "sync" => Cmd::Sync(v["id"].as_str().map(str::to_string).unwrap_or_else(|| v["id"].to_string()), v["frames"].as_u64().unwrap_or(1) as u32),
         "quit" => Cmd::Quit,
@@ -296,10 +354,90 @@ pub fn parse_opts(args: &[String]) -> Result<LiveOpts> {
         frame_log: flag("--frame-log").map(PathBuf::from),
         display_scale: flag("--display-scale").map(|v| v.parse::<f32>()).transpose()?.unwrap_or(1.0),
         launch: parse_launch(flag("--launch").as_deref())?,
+        stream: flag("--stream").map(PathBuf::from),
     })
 }
 
 /// `--launch '{"room":"K7Q4MZ","name":"Ada"}'`: the `params` of the host channel's `launch` message.
 pub fn parse_launch(v: Option<&str>) -> Result<Option<serde_json::Value>> {
     v.map(|t| serde_json::from_str::<serde_json::Value>(t).ok().filter(|p| p.is_object()).ok_or_else(|| anyhow!("--launch must be a JSON object, as in --launch '{{\"room\":\"K7Q4MZ\"}}'"))).transpose()
+}
+
+/// known-future `--stream`: frames read back through a ring of buffers one frame behind the GPU and written to a FIFO
+/// by a thread of their own, in order. The byte buffers go back and forth, so no frame allocates.
+struct Stream {
+    ring: Vec<wgpu::Buffer>,
+    next: usize,
+    pend: std::collections::VecDeque<(usize, Arc<std::sync::atomic::AtomicBool>)>,
+    tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    back: mpsc::Receiver<Vec<u8>>,
+    spare: Vec<Vec<u8>>,
+    writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    pub(super) read_ms: f64,
+}
+
+impl Stream {
+    fn new(d: &wgpu::Device, path: PathBuf, size: u64) -> Stream {
+        let ring = (0..3).map(|_| d.create_buffer(&wgpu::BufferDescriptor { label: Some("stream"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })).collect();
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(2);
+        let (btx, back) = mpsc::channel::<Vec<u8>>();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path)?;
+            for b in rx {
+                f.write_all(&b)?;
+                let _ = btx.send(b);
+            }
+            f.flush()
+        });
+        Stream { ring, next: 0, pend: Default::default(), tx: Some(tx), back, spare: vec![], writer: Some(writer), read_ms: 0.0 }
+    }
+
+    /// The frame just submitted copied its output into `ring[next]`: map it, and read what is older than one frame.
+    fn queued(&mut self, d: &wgpu::Device) -> Result<()> {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        self.ring[self.next].slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            if r.is_ok() {
+                flag.store(true, Ordering::Release);
+            }
+        });
+        self.pend.push_back((self.next, done));
+        self.next = (self.next + 1) % self.ring.len();
+        self.drain(d, 1)
+    }
+
+    /// Reads (waiting for them) all but `keep` of the frames in flight, oldest first, and hands them to the writer.
+    fn drain(&mut self, d: &wgpu::Device, keep: usize) -> Result<()> {
+        while self.pend.len() > keep {
+            let (i, done) = self.pend.pop_front().unwrap();
+            let t = Instant::now();
+            while !done.load(Ordering::Acquire) {
+                d.poll(wgpu::PollType::Poll)?;
+                if !done.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+            self.spare.extend(self.back.try_iter());
+            let mut buf = self.spare.pop().unwrap_or_default();
+            buf.clear();
+            buf.extend_from_slice(&self.ring[i].slice(..).get_mapped_range()?);
+            self.ring[i].unmap();
+            self.read_ms += t.elapsed().as_secs_f64() * 1e3;
+            if let Some(tx) = &self.tx {
+                tx.send(buf).map_err(|_| anyhow!("stream: the writer stopped (reader gone?)"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, d: &wgpu::Device) -> Result<()> {
+        self.drain(d, 0)?;
+        drop(self.tx.take());
+        if let Some(w) = self.writer.take() {
+            w.join().map_err(|_| anyhow!("stream writer panicked"))??;
+        }
+        eprintln!("live: stream closed (read-back {:.1} ms in all)", self.read_ms);
+        Ok(())
+    }
 }

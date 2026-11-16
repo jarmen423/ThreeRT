@@ -19,6 +19,8 @@ pub struct Packed {
     pub layers: Vec<Vec<image::RgbaImage>>,
     /// Per texture two vec4: (u0, v0, du, dv) of the content rect in page UV; (layer, wrap, width, height).
     pub info: Vec<[f32; 4]>,
+    /// known-future: per texture, layer, padded rect x, y, w, h in the page and the content's w, h.
+    pub place: Vec<[u32; 7]>,
 }
 
 fn round_up(v: u32) -> u32 {
@@ -28,7 +30,7 @@ fn round_up(v: u32) -> u32 {
 pub fn pack(textures: &[Texture]) -> Packed {
     if textures.is_empty() {
         let img = image::RgbaImage::from_pixel(ALIGN, ALIGN, image::Rgba([255, 255, 255, 255]));
-        return Packed { side: ALIGN, layers: vec![mip_chain(img)], info: vec![[0.0; 4], [0.0; 4]] };
+        return Packed { side: ALIGN, layers: vec![mip_chain(img)], info: vec![[0.0; 4], [0.0; 4]], place: vec![] };
     }
     // Power-of-two textures >= 512 give up 2 x GUTTER texels so the padded rect stays a power of two and four
     // 2048s (or sixteen 1024s) fill a page exactly; anything else keeps its size and is padded.
@@ -119,7 +121,26 @@ pub fn pack(textures: &[Texture]) -> Packed {
             image::RgbaImage::from_raw(side, side, bytemuck::cast_slice(&page).to_vec()).unwrap()
         })
         .collect();
-    Packed { side, layers: pages.into_par_iter().map(mip_chain).collect(), info }
+    let place = (0..src.len()).map(|i| [place[i].0, place[i].1, place[i].2, padded[i].0, padded[i].1, src[i].width(), src[i].height()]).collect();
+    Packed { side, layers: pages.into_par_iter().map(mip_chain).collect(), info, place }
+}
+
+/// known-future: one texture's padded rect (`pw` x `ph`, the content `GUTTER` texels in, gutters wrapped or clamped as
+/// `pack` fills them) and its mip chain, as the pages hold them (rects are `ALIGN`ed, so each level is its own).
+pub fn padded_chain(img: &image::RgbaImage, pw: u32, ph: u32, wrap: bool) -> Vec<image::RgbaImage> {
+    let (w, h) = (img.width() as i64, img.height() as i64);
+    let fold = |v: i64, n: i64| if wrap { v.rem_euclid(n) } else { v.clamp(0, n - 1) } as usize;
+    let g = GUTTER as i64;
+    let mut out = vec![0u32; (pw * ph) as usize];
+    let src: &[u32] = bytemuck::cast_slice(img.as_raw());
+    out.par_chunks_mut(pw as usize).enumerate().for_each(|(row, dst)| {
+        let sy = fold(row as i64 - g, h);
+        let srow = &src[sy * w as usize..(sy + 1) * w as usize];
+        for (xx, o) in dst.iter_mut().enumerate() {
+            *o = srow[fold(xx as i64 - g, w)];
+        }
+    });
+    mip_chain(image::RgbaImage::from_raw(pw, ph, bytemuck::cast_slice(&out).to_vec()).unwrap())
 }
 
 /// 2x2 box-filtered chain (sRGB-encoded texels are averaged as stored, like most engines' default mip gen).
