@@ -45,7 +45,11 @@
         }
         let t = t0 + h.t;
         if (solid || is_proc(h) || !cutout(h.tri) || alpha_pass(h.tri, h.inst, h.u, h.v, t)) { return Hit(t, h.tri, h.u, h.v, h.inst); }
-        if (first) { first = false; } else { t0 = t + 1e-4 * max(1.0, t); }
+        // known-future: past a cutout the next query starts 2 um on, not 0.1 mm: a key legend 0.03 mm over its key top,
+        // seen at 67 degrees, stood 0.077 mm before the top along the ray, and the 0.1 mm step started the ray inside
+        // the key, past its top (S02: the keys black, every light at half). 2e-6 relative stays far above f32 at film
+        // distances.
+        if (first) { first = false; } else { t0 = t + 2e-6 * max(1.0, t); }
     }
     if (any) { return Hit(t0, 0u, 0.0, 0.0, NO_INST); }
     return Hit(tmax_in, 0xffffffffu, 0.0, 0.0, NO_INST);
