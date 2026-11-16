@@ -85,6 +85,9 @@ pub struct LiveOpts {
     pub launch: Option<serde_json::Value>,
     /// known-future `--stream PATH`: every frame a step marks `emit` goes to PATH (a FIFO) as BGRA8, w x h x 4 bytes.
     pub stream: Option<PathBuf>,
+    /// known-future `--stream-format nv12`: frames go out as NV12 (BT.709 limited range, the encoder's input: w x h luma,
+    /// then w x h/2 of interleaved chroma), converted on the GPU, w x h x 3/2 bytes; else BGRA8.
+    pub stream_nv12: bool,
 }
 
 /// known-future: pathtrace.wgsl MAT_KF_SHARP, a bit of a material's flags (`tex1[2]`).

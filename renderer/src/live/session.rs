@@ -27,7 +27,8 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
     let staging = core.g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("snapshot"), size: (w * h * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     // known-future `--stream`: frames out through a ring of read-back buffers and a writer thread that writes them from
     // the mapped buffers (the reader of the FIFO paces it).
-    let mut stream = opts.stream.clone().map(|p| Stream::new(&core.g.device, p, (w * h * 4) as u64));
+    let nv12 = (opts.stream.is_some() && opts.stream_nv12).then(|| Nv12::new(&core.g.device, &core.targets.out, w, h));
+    let mut stream = opts.stream.clone().map(|p| Stream::new(&core.g.device, p, if nv12.is_some() { (w * h * 3 / 2) as u64 } else { (w * h * 4) as u64 }));
     let mut emits: Vec<(u32, u32)> = vec![]; // core.frame ranges to stream
     let mut lock_spp = 1u32;
     let frame_dt = Duration::from_secs_f64(1.0 / opts.fps as f64);
@@ -176,7 +177,13 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                 e.copy_buffer_to_buffer(out, 0, &staging, 0, (w * h * 4) as u64);
             }
             if let Some(r) = ring {
-                e.copy_buffer_to_buffer(out, 0, r, 0, r.size());
+                match &nv12 {
+                    Some(c) => {
+                        c.record(e);
+                        e.copy_buffer_to_buffer(&c.buf, 0, r, 0, r.size());
+                    }
+                    None => e.copy_buffer_to_buffer(out, 0, r, 0, r.size()),
+                }
             }
         });
         if let (Some(st), Some(i)) = (&mut stream, slot) {
@@ -415,6 +422,7 @@ pub fn parse_opts(args: &[String]) -> Result<LiveOpts> {
         display_scale: flag("--display-scale").map(|v| v.parse::<f32>()).transpose()?.unwrap_or(1.0),
         launch: parse_launch(flag("--launch").as_deref())?,
         stream: flag("--stream").map(PathBuf::from),
+        stream_nv12: flag("--stream-format").is_some_and(|f| f == "nv12"),
     })
 }
 
@@ -505,6 +513,87 @@ impl Stream {
         }
         eprintln!("live: stream closed (render thread waited {:.1} ms for a free buffer; the writer {:.1} ms for mappings)", self.wait_ms, map_wait);
         Ok(())
+    }
+}
+
+/// known-future `--stream-format nv12`: the frame's BGRA8 output converted to NV12 on the GPU, exactly as the
+/// known-future compositor converts (compositor.py `to_nv12`: each 8-bit channel / 255 rounded to f16, BT.709 luma
+/// 16 + 219 Y, chroma 128 + 224 (B - Y) / 1.8556 and 128 + 224 (R - Y) / 1.5748 averaged over 2 x 2, rounded half to
+/// even), so the compositor hands the bytes to the encoder as they are. One invocation a 4 x 2 block of pixels.
+struct Nv12 {
+    pipe: wgpu::ComputePipeline,
+    bg: wgpu::BindGroup,
+    buf: wgpu::Buffer,
+    groups: (u32, u32),
+}
+
+const NV12_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+fn h16(x: f32) -> f32 { return unpack2x16float(pack2x16float(vec2<f32>(x, 0.0))).x; }
+fn ch(p: u32, sh: u32) -> f32 { return clamp(h16(f32((p >> sh) & 255u) / 255.0), 0.0, 1.0); }
+fn byte(x: f32) -> u32 { return u32(clamp(round(x), 0.0, 255.0)); }
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = dims.x;
+    let h = dims.y;
+    if (gid.x * 4u >= w || gid.y * 2u >= h) { return; }
+    let kr = 0.2126;
+    let kb = 0.0722;
+    let kg = 0.7152;
+    var us: array<f32, 8>;
+    var vs: array<f32, 8>;
+    for (var j = 0u; j < 2u; j++) {
+        let y = gid.y * 2u + j;
+        var word = 0u;
+        for (var i = 0u; i < 4u; i++) {
+            let p = src[y * w + gid.x * 4u + i];
+            let r = ch(p, 16u);
+            let g = ch(p, 8u);
+            let b = ch(p, 0u);
+            let yl = kr * r + kg * g + kb * b;
+            word |= byte(16.0 + 219.0 * yl) << (8u * i);
+            us[j * 4u + i] = 128.0 + 224.0 * (b - yl) / 1.8556;
+            vs[j * 4u + i] = 128.0 + 224.0 * (r - yl) / 1.5748;
+        }
+        dst[(y * w + gid.x * 4u) / 4u] = word;
+    }
+    var uv = 0u;
+    for (var k = 0u; k < 2u; k++) {
+        let a = k * 2u;
+        let u = (us[a] + us[a + 1u] + us[4u + a] + us[4u + a + 1u]) / 4.0;
+        let v = (vs[a] + vs[a + 1u] + vs[4u + a] + vs[4u + a + 1u]) / 4.0;
+        uv |= (byte(u) | (byte(v) << 8u)) << (16u * k);
+    }
+    dst[(w * h + gid.y * w + gid.x * 4u) / 4u] = uv;
+}
+"#;
+
+impl Nv12 {
+    fn new(d: &wgpu::Device, out: &wgpu::Buffer, w: u32, h: u32) -> Nv12 {
+        use wgpu::util::DeviceExt;
+        let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("kf nv12"), source: wgpu::ShaderSource::Wgsl(NV12_WGSL.into()) });
+        let pipe = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("kf nv12"), layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let buf = d.create_buffer(&wgpu::BufferDescriptor { label: Some("kf nv12"), size: (w * h * 3 / 2) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let dims = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("kf nv12 dims"), contents: bytemuck::cast_slice(&[w, h, 0u32, 0u32]), usage: wgpu::BufferUsages::UNIFORM });
+        let bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kf nv12"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: out.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
+            ],
+        });
+        Nv12 { pipe, bg, buf, groups: ((w / 4).div_ceil(8), (h / 2).div_ceil(8)) }
+    }
+
+    fn record(&self, e: &mut wgpu::CommandEncoder) {
+        let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("kf nv12"), timestamp_writes: None });
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, &self.bg, &[]);
+        pass.dispatch_workgroups(self.groups.0, self.groups.1, 1);
     }
 }
 
