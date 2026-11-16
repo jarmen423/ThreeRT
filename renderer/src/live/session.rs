@@ -232,7 +232,8 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
         prev_start = t_frame;
         last_frame = Instant::now();
         core.govern_resolution(opts.fps);
-        spp = if core.render_scale < 1.0 { 1 } else if lockstep.is_some() { lock_spp } else { next_spp(spp, core.gpu_ms, opts.fps) };
+        // known-future: lockstep takes the samples asked for (`spp`) at any render scale
+        spp = if lockstep.is_some() { lock_spp } else if core.render_scale < 1.0 { 1 } else { next_spp(spp, core.gpu_ms, opts.fps) };
         let _ = core.g.device.poll(wgpu::PollType::Poll);
         if lockstep.is_some() {
             budget -= 1;
