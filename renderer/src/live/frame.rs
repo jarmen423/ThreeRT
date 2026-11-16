@@ -349,6 +349,8 @@ impl LiveCore {
         let media_composite = media.then(|| g.kernel_pass(&self.sc.up.kernel, "media_composite"));
         // The pixels a sample's trace leaves at the radiance cache (pathtrace.wgsl `finish`).
         let finish = self.targets.kernel.deferred.as_ref().filter(|_| self.cache.is_some()).map(|d| (g.kernel_pass(&self.sc.up.kernel, "finish"), d));
+        // known-future: a screen's own picture at output resolution (pathtrace.wgsl `kf_sharp`), after the frame's samples.
+        let kf_sharp = kf_sharp_env().then(|| g.kernel_pass(&self.sc.up.kernel, "kf_sharp"));
         // This frame's sub-pixel jitter (Halton 2, 3), every camera ray's and the raster visibility pass's: 8 phases at
         // full resolution, as many more as an output pixel has fewer traced ones (8 / scale^2: the upscaler needs each
         // output pixel visited), in the 12 bits a side the samples carry it in.
@@ -480,6 +482,10 @@ impl LiveCore {
                 if let (Some(mc), true) = (&media_composite, last) {
                     pass.set_pipeline(mc);
                     pass.dispatch_workgroups(iw.div_ceil(8), ih.div_ceil(8), 1);
+                }
+                if let (Some(ks), true) = (&kf_sharp, last) {
+                    pass.set_pipeline(ks);
+                    pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
                 }
             }
             if let (Some(p), true, true) = (&self.profile, k + 1 == spp.max(1), media_composite.is_some()) {

@@ -53,6 +53,10 @@ const VOL_RATE_MASK: u32 = 1u;
 const MAT_DOUBLE_SIDED: i32 = 1;
 const MAT_EMITTER_CARD: i32 = 2;
 const MAT_UNLIT: i32 = 4;
+// known-future: a flag bit (live `{"cmd":"sharp"}`): what the camera sees of this material's emission is drawn at output
+// resolution by `kf_sharp` after the trace, not traced at render scale and through the temporal upscaler (a laptop
+// screen playing a video: its own picture needs no sampling).
+const MAT_KF_SHARP: i32 = 8;
 // Live (real-time) mode: write this frame's 1-spp sample + first-hit distance instead of accumulating.
 override LIVE: bool = false;
 // The live renderer's approximations (gpu::A_*; docs/RUNTIME.md "How live differs from offline"): what a live path
@@ -998,6 +1002,8 @@ struct Surface {
     card: bool,
     // Shading changes over time (animated emission, rain ripples): the live viewport keeps a short history here.
     anim: bool,
+    // known-future: emission drawn at output resolution (MAT_KF_SHARP).
+    kf_sharp: bool,
     // Glass (transmission share, index of refraction) and clearcoat (amount, perceptual roughness).
     transmission: f32,
     ior: f32,
@@ -1212,6 +1218,7 @@ fn surface(o: vec3<f32>, d: vec3<f32>, h: Hit, width: f32) -> Surface {
     s.p = p;
     s.front = front;
     s.card = m.tex1.z == MAT_EMITTER_CARD;
+    s.kf_sharp = (m.tex1.z & MAT_KF_SHARP) != 0;
     var base = m.base_color.rgb;
     if (has(F_TINT)) { base *= obj_tint(object_of(a)); }
     if (has(F_VCOLOR)) { base *= vcolor(i, h.u, h.v); }
@@ -3379,6 +3386,58 @@ fn media_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (direct_len() >= w * h) { direct_store(pix, vec4<f32>(direct_load(pix).rgb * mm.tr, direct_load(pix).w)); }
 }
 
+// known-future: the output grid (the camera's, before the render scale): height for texture LOD (lod_height), width
+// from the aspect.
+fn kf_out_h() -> u32 { return u32(lod_height()); }
+fn kf_out_w() -> u32 { return u32(round(lod_height() * P.cam_fwd.w)); }
+// The direct buffer's tail past the traced grid holds `kf_sharp`'s output-resolution emission (live `THREERT_KF_SHARP`
+// sizes it so); without that tail nothing is drawn sharp.
+fn kf_sharp_on() -> bool { return direct_len() >= P.size.x * P.size.y + kf_out_w() * kf_out_h(); }
+
+// known-future: emission of MAT_KF_SHARP surfaces seen directly, at output resolution: one camera ray through each
+// output pixel's centre, the emission texture filtered for that pixel's footprint (no sampling noise, no history, this
+// frame's picture), into the direct buffer's tail for live.wgsl `upscale` to add to the upscaled image (depth of
+// field and the rest of post follow). Everything else about the surface (its glass's reflections, what stands in front
+// of it) stays the trace's.
+@compute @workgroup_size(8, 8, 1)
+fn kf_sharp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ow = kf_out_w();
+    let oh = kf_out_h();
+    if (gid.x >= ow || gid.y >= oh || !kf_sharp_on()) { return; }
+    cur_depth = 0u;
+    mirror_path = false;
+    let ndc = vec2<f32>((f32(gid.x) + 0.5) / f32(ow) * 2.0 - 1.0, 1.0 - (f32(gid.y) + 0.5) / f32(oh) * 2.0);
+    let d = normalize(P.cam_fwd.xyz + P.cam_right.xyz * (ndc.x * P.cam_pos.w * P.cam_fwd.w) + P.cam_up.xyz * (ndc.y * P.cam_pos.w));
+    let o = P.cam_pos.xyz;
+    let hit = trace(o, d, INF, TRACE_CLOSEST);
+    var e = vec3<f32>(0.0);
+    if (hit.tri != 0xffffffffu && !is_proc(hit)) {
+        var a = attrs[hit.tri];
+        if (has(F_INST) && hit.inst != NO_INST) { a = inst_attr(instance_at(hit.inst), a); }
+        let m = material_at(bitcast<u32>(a.uv.w));
+        if ((m.tex1.z & MAT_KF_SHARP) != 0) {
+            var e1 = tri_verts[hit.tri * 3u + 1u].xyz;
+            var e2 = tri_verts[hit.tri * 3u + 2u].xyz;
+            if (has(F_INST) && hit.inst != NO_INST) {
+                let r = instance_at(hit.inst);
+                e1 = inst_vec(r, e1);
+                e2 = inst_vec(r, e2);
+            }
+            let ng = normalize(cross(e1, e2));
+            // The footprint of one output pixel at the hit (as the trace's cone, at output resolution), without the
+            // trace's sharpening bias (its accumulation antialiases; this is one sample): the texture's own filter.
+            let width = 2.0 * P.cam_pos.w / f32(oh) * hit.t;
+            let lod = mesh_lod(a, m) + log2(max(width, 1e-7)) - 0.5 * log2(max(abs(dot(ng, d)), 1e-3)) + KF_SHARP_LOD;
+            e = emission(m, mesh_uv(a, m, hit.u, hit.v), lod) * obj_power(a);
+            if (non_finite(e)) { e = vec3<f32>(0.0); }
+        }
+    }
+    direct_store(P.size.x * P.size.y + gid.y * ow + gid.x, vec4<f32>(e, 0.0));
+}
+
+// Mip bias of `kf_sharp`'s texture lookups (0: the pixel's footprint; Cycles' pixel filter is a little wider).
+const KF_SHARP_LOD: f32 = 0.0;
+
 // Once per frame after the trace: folds the frame's training sums into each entry (history capped at P.cache.y
 // samples and P.cache.z frames, so lighting changes show within a few frames), ages entries, frees stale ones.
 @compute @workgroup_size(256, 1, 1)
@@ -3653,8 +3712,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let lum = luminance(c);
                 if (lum > clamp_v) { c *= clamp_v / lum; }
             }
-            if (depth == 0u) { e0 += c; }
-            radiance += c;
+            // known-future: a MAT_KF_SHARP surface's emission seen by the camera is `kf_sharp`'s, at output resolution.
+            if (!(LIVE && depth == 0u && s.kf_sharp && kf_sharp_on())) {
+                if (depth == 0u) { e0 += c; }
+                radiance += c;
+            }
         }
         if (s.card) { break; }
         @if(!last_direct && !last_sun) if (depth == P.counts.z) { break; }

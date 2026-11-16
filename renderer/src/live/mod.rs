@@ -87,6 +87,14 @@ pub struct LiveOpts {
     pub stream: Option<PathBuf>,
 }
 
+/// known-future: pathtrace.wgsl MAT_KF_SHARP, a bit of a material's flags (`tex1[2]`).
+pub const KF_SHARP_FLAG: i32 = 8;
+
+/// known-future: THREERT_KF_SHARP=1 sizes the direct buffer for `kf_sharp`'s output-resolution emission and runs it.
+pub fn kf_sharp_env() -> bool {
+    std::env::var("THREERT_KF_SHARP").is_ok_and(|v| v == "1")
+}
+
 /// Lowest dynamic-resolution scale (UE r.DynamicRes.MinScreenPercentage default) of a view whose pixels are the
 /// display's points; a host whose view is in the display's physical pixels divides it by the display's scale factor
 /// (`LiveCore::min_scale`), so the fewest rays a window traces do not depend on the display's density.
@@ -227,6 +235,9 @@ pub enum Cmd {
     /// known-future: the emission (rgb nits) of the materials whose emission at load was `matched` (within 1e-3
     /// relative), in place: a glTF screen or bulb whose strength changes every frame, without a material function.
     Emissive { matched: [f32; 3], rgb: [f32; 3] },
+    /// known-future: the materials whose emission at load was `matched` drawn sharp (pathtrace.wgsl `kf_sharp`: what
+    /// the camera sees of their emission at output resolution, past the upscaler; needs THREERT_KF_SHARP=1).
+    Sharp { matched: [f32; 3] },
     /// Drop all accumulated history (benchmarks measure convergence from here).
     Reset,
     /// Set the scene time, s (benchmarks: with lockstep, frame k from here renders at t + k x its frame time; frame
@@ -714,7 +725,8 @@ impl LiveCore {
 
     /// known-future: the view of a film frame (`Cmd::View`): camera, depth of field and manual exposure, set in place
     /// (the scene's camera must have a manual exposure: `apply_exposure`'s rule).
-    pub fn set_emissive(&mut self, matched: [f32; 3], rgb: [f32; 3]) -> usize {
+    /// known-future: the materials whose emission at load was `matched` (within 1e-3 relative), found once.
+    fn kf_matched(&mut self, matched: [f32; 3]) -> Vec<usize> {
         let key = format!("{matched:?}");
         if !self.kf_emissive.contains_key(&key) {
             let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * a.abs().max(b.abs()).max(1e-6);
@@ -723,7 +735,23 @@ impl LiveCore {
                 .collect();
             self.kf_emissive.insert(key.clone(), ids);
         }
-        let ids = self.kf_emissive[&key].clone();
+        self.kf_emissive[&key].clone()
+    }
+
+    /// known-future: `Cmd::Sharp`, the MAT_KF_SHARP flag on the matched materials.
+    pub fn set_sharp(&mut self, matched: [f32; 3]) -> usize {
+        let ids = self.kf_matched(matched);
+        for &i in &ids {
+            self.sc.tables.materials[i].tex1[2] |= KF_SHARP_FLAG;
+        }
+        if !ids.is_empty() {
+            self.upload_materials();
+        }
+        ids.len()
+    }
+
+    pub fn set_emissive(&mut self, matched: [f32; 3], rgb: [f32; 3]) -> usize {
+        let ids = self.kf_matched(matched);
         for &i in &ids {
             self.sc.tables.materials[i].emissive = [rgb[0], rgb[1], rgb[2], self.sc.tables.materials[i].emissive[3]];
         }

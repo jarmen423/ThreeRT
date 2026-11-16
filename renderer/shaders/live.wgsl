@@ -1519,8 +1519,13 @@ fn upscale(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let lin = finite_or_zero(max(outc, vec3<f32>(0.0)));
     color_hist[this_half(i)] = vec4<f32>(lin, count);
+    // known-future: what pathtrace.wgsl `kf_sharp` drew at output resolution (a screen's own picture), added past the
+    // history: the direct buffer's tail after the traced grid, there only when the renderer sized it so.
+    var shown = lin;
+    let ks = L.isz.x * L.isz.y;
+    if (arrayLength(&direct_in) >= ks + w * h) { shown += finite_or_zero(max(direct_in[ks + i].rgb, vec3<f32>(0.0))); }
     // The image: into fa, or into sb for depth of field / motion blur to read (w: the CoC of the nearest sample's depth).
-    let img = vec4<f32>(lin, dof_coc(sample_vel[u32(bc.y * iw + bc.x)].z));
+    let img = vec4<f32>(shown, dof_coc(sample_vel[u32(bc.y * iw + bc.x)].z));
     if (L.misc2.z > 0.0 || L.dof.x > 0.0) { sb[i] = img; } else { fa[i] = img; }
 }
 

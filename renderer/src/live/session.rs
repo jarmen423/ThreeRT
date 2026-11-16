@@ -25,8 +25,8 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
     eprintln!("live: load {}", serde_json::Value::Object(core.load_timings().iter().map(|(k, v)| (k.clone(), (*v).into())).collect()));
     eprintln!("live: {}x{} @{} fps on {} ({})", w, h, opts.fps, core.g.adapter_info.name, if core.g.hwrt { "HW RT" } else { "BVH" });
     let staging = core.g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("snapshot"), size: (w * h * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-    // known-future `--stream`: frames out through a ring of three read-back buffers, one frame behind the GPU, and a
-    // writer thread (the reader of the FIFO paces it); its byte buffers come back for reuse.
+    // known-future `--stream`: frames out through a ring of read-back buffers and a writer thread that writes them from
+    // the mapped buffers (the reader of the FIFO paces it).
     let mut stream = opts.stream.clone().map(|p| Stream::new(&core.g.device, p, (w * h * 4) as u64));
     let mut emits: Vec<(u32, u32)> = vec![]; // core.frame ranges to stream
     let mut lock_spp = 1u32;
@@ -49,9 +49,6 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
         // (known-future: a film driver sends frame k+1's view right behind frame k's step; held here until k is drawn).
         let mut cmds: std::collections::VecDeque<Cmd> = std::mem::take(&mut held);
         if lockstep.is_some() && budget == 0 && cmds.is_empty() {
-            if let Some(st) = &mut stream {
-                st.drain(&core.g.device, 0)?;
-            }
             match cmd_rx.recv() {
                 Ok(c) => cmds.push_back(c),
                 Err(_) => return Ok(()),
@@ -125,6 +122,10 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                         Err(e) => eprintln!("live: texture {key}: {e:#}"),
                     }
                 }
+                Cmd::Sharp { matched } => {
+                    let n = core.set_sharp(matched);
+                    eprintln!("live: sharp {matched:?}: {n} material(s){}", if kf_sharp_env() { "" } else { " (THREERT_KF_SHARP is not 1: drawn as before)" });
+                }
                 Cmd::Emissive { matched, rgb } => {
                     if core.set_emissive(matched, rgb) == 0 {
                         eprintln!("live: emissive {matched:?}: no material emits that");
@@ -134,7 +135,7 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
                 Cmd::Status(_) => {}
                 Cmd::Quit => {
                     if let Some(st) = stream.take() {
-                        st.finish(&core.g.device)?;
+                        st.finish()?;
                     }
                     return Ok(());
                 }
@@ -165,19 +166,21 @@ pub fn run(presets: &Path, opts: LiveOpts) -> Result<()> {
         let fno0 = core.frame;
         let emit_this = stream.is_some() && emits.iter().any(|&(a, b)| fno0 >= a && fno0 <= b);
         emits.retain(|&(_, b)| b > fno0);
-        let ring = stream.as_ref().filter(|_| emit_this).map(|st| &st.ring[st.next]);
+        let slot = match (&mut stream, emit_this) {
+            (Some(st), true) => Some(st.acquire()?),
+            _ => None,
+        };
+        let ring = stream.as_ref().zip(slot).map(|(st, i)| &st.ring[i]);
         core.render(spp, |e, out| {
             if pending {
                 e.copy_buffer_to_buffer(out, 0, &staging, 0, (w * h * 4) as u64);
             }
             if let Some(r) = ring {
-                e.copy_buffer_to_buffer(out, 0, r, 0, (w * h * 4) as u64);
+                e.copy_buffer_to_buffer(out, 0, r, 0, r.size());
             }
         });
-        if emit_this {
-            if let Some(st) = &mut stream {
-                st.queued(&core.g.device)?;
-            }
+        if let (Some(st), Some(i)) = (&mut stream, slot) {
+            st.queued(i)?;
         }
         game.click_shown();
         let (hist, fno) = (core.history_len as u32, core.frame);
@@ -331,6 +334,10 @@ pub fn parse_cmd(line: &str) -> Option<Cmd> {
             let f3 = |k: &str| v[k].as_array().filter(|a| a.len() == 3).map(|a| [a[0].as_f64().unwrap_or(0.0) as f32, a[1].as_f64().unwrap_or(0.0) as f32, a[2].as_f64().unwrap_or(0.0) as f32]);
             Cmd::Emissive { matched: f3("match")?, rgb: f3("rgb")? }
         }
+        "sharp" => {
+            let a = v["match"].as_array().filter(|a| a.len() == 3)?;
+            Cmd::Sharp { matched: [a[0].as_f64().unwrap_or(0.0) as f32, a[1].as_f64().unwrap_or(0.0) as f32, a[2].as_f64().unwrap_or(0.0) as f32] }
+        }
         "texture" => {
             // Decoded on rayon's pool as the command arrives, ahead of the frames and in parallel (a film's screen is a
             // 4-megapixel PNG a frame): raw RGBA8 (`.rgba`, with w and h) or any image file. The frame that uses it
@@ -416,81 +423,87 @@ pub fn parse_launch(v: Option<&str>) -> Result<Option<serde_json::Value>> {
     v.map(|t| serde_json::from_str::<serde_json::Value>(t).ok().filter(|p| p.is_object()).ok_or_else(|| anyhow!("--launch must be a JSON object, as in --launch '{{\"room\":\"K7Q4MZ\"}}'"))).transpose()
 }
 
-/// known-future `--stream`: frames read back through a ring of buffers one frame behind the GPU and written to a FIFO
-/// by a thread of their own, in order. The byte buffers go back and forth, so no frame allocates.
+/// known-future `--stream`: frames read back through a ring of buffers and written to a FIFO by a thread of their own,
+/// in order, straight from the mapped buffer (no copy on the render thread: at 4K the copy was ~9 ms a frame there).
+/// The render thread takes a free buffer (`acquire`, waiting only when every one is still being written), the frame
+/// copies its output into it, `queued` maps it and hands it to the writer, which waits for the mapping (polling the
+/// device), writes, unmaps and gives the buffer back.
 struct Stream {
     ring: Vec<wgpu::Buffer>,
-    next: usize,
-    pend: std::collections::VecDeque<(usize, Arc<std::sync::atomic::AtomicBool>)>,
-    tx: Option<mpsc::SyncSender<Vec<u8>>>,
-    back: mpsc::Receiver<Vec<u8>>,
-    spare: Vec<Vec<u8>>,
-    writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
-    pub(super) read_ms: f64,
+    free: mpsc::Receiver<usize>,
+    tx: Option<mpsc::SyncSender<(usize, Arc<std::sync::atomic::AtomicBool>)>>,
+    writer: Option<std::thread::JoinHandle<std::io::Result<f64>>>,
+    pub(super) wait_ms: f64,
 }
+
+/// Read-back buffers in the ring: frames in flight between the GPU and the FIFO's reader.
+const STREAM_RING: usize = 4;
 
 impl Stream {
     fn new(d: &wgpu::Device, path: PathBuf, size: u64) -> Stream {
-        let ring = (0..3).map(|_| d.create_buffer(&wgpu::BufferDescriptor { label: Some("stream"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })).collect();
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(2);
-        let (btx, back) = mpsc::channel::<Vec<u8>>();
-        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        let ring: Vec<wgpu::Buffer> = (0..STREAM_RING).map(|_| d.create_buffer(&wgpu::BufferDescriptor { label: Some("stream"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })).collect();
+        let (tx, rx) = mpsc::sync_channel::<(usize, Arc<std::sync::atomic::AtomicBool>)>(STREAM_RING);
+        let (ftx, free) = mpsc::channel::<usize>();
+        for i in 0..STREAM_RING {
+            let _ = ftx.send(i);
+        }
+        let (dev, bufs) = (d.clone(), ring.clone());
+        let writer = std::thread::spawn(move || -> std::io::Result<f64> {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path)?;
-            for b in rx {
-                f.write_all(&b)?;
-                let _ = btx.send(b);
+            let mut map_wait = 0.0;
+            for (i, done) in rx {
+                let t = Instant::now();
+                while !done.load(Ordering::Acquire) {
+                    let _ = dev.poll(wgpu::PollType::Poll);
+                    if !done.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_micros(100));
+                    }
+                }
+                map_wait += t.elapsed().as_secs_f64() * 1e3;
+                {
+                    let view = bufs[i].slice(..).get_mapped_range().map_err(|e| std::io::Error::other(format!("stream map: {e:?}")))?;
+                    f.write_all(&view)?;
+                }
+                bufs[i].unmap();
+                let _ = ftx.send(i);
             }
-            f.flush()
+            f.flush()?;
+            Ok(map_wait)
         });
-        Stream { ring, next: 0, pend: Default::default(), tx: Some(tx), back, spare: vec![], writer: Some(writer), read_ms: 0.0 }
+        Stream { ring, free, tx: Some(tx), writer: Some(writer), wait_ms: 0.0 }
     }
 
-    /// The frame just submitted copied its output into `ring[next]`: map it, and read what is older than one frame.
-    fn queued(&mut self, d: &wgpu::Device) -> Result<()> {
+    /// A buffer free for this frame's output (waits while the writer has them all).
+    fn acquire(&mut self) -> Result<usize> {
+        let t = Instant::now();
+        let i = self.free.recv().map_err(|_| anyhow!("stream: the writer stopped (reader gone?)"))?;
+        self.wait_ms += t.elapsed().as_secs_f64() * 1e3;
+        Ok(i)
+    }
+
+    /// The frame just submitted copied its output into `ring[i]`: map it and hand it to the writer.
+    fn queued(&mut self, i: usize) -> Result<()> {
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = done.clone();
-        self.ring[self.next].slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        self.ring[i].slice(..).map_async(wgpu::MapMode::Read, move |r| {
             if r.is_ok() {
                 flag.store(true, Ordering::Release);
             }
         });
-        self.pend.push_back((self.next, done));
-        self.next = (self.next + 1) % self.ring.len();
-        self.drain(d, 1)
-    }
-
-    /// Reads (waiting for them) all but `keep` of the frames in flight, oldest first, and hands them to the writer.
-    fn drain(&mut self, d: &wgpu::Device, keep: usize) -> Result<()> {
-        while self.pend.len() > keep {
-            let (i, done) = self.pend.pop_front().unwrap();
-            let t = Instant::now();
-            while !done.load(Ordering::Acquire) {
-                d.poll(wgpu::PollType::Poll)?;
-                if !done.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_micros(100));
-                }
-            }
-            self.spare.extend(self.back.try_iter());
-            let mut buf = self.spare.pop().unwrap_or_default();
-            buf.clear();
-            buf.extend_from_slice(&self.ring[i].slice(..).get_mapped_range()?);
-            self.ring[i].unmap();
-            self.read_ms += t.elapsed().as_secs_f64() * 1e3;
-            if let Some(tx) = &self.tx {
-                tx.send(buf).map_err(|_| anyhow!("stream: the writer stopped (reader gone?)"))?;
-            }
+        if let Some(tx) = &self.tx {
+            tx.send((i, done)).map_err(|_| anyhow!("stream: the writer stopped (reader gone?)"))?;
         }
         Ok(())
     }
 
-    fn finish(mut self, d: &wgpu::Device) -> Result<()> {
-        self.drain(d, 0)?;
+    fn finish(mut self) -> Result<()> {
         drop(self.tx.take());
+        let mut map_wait = 0.0;
         if let Some(w) = self.writer.take() {
-            w.join().map_err(|_| anyhow!("stream writer panicked"))??;
+            map_wait = w.join().map_err(|_| anyhow!("stream writer panicked"))??;
         }
-        eprintln!("live: stream closed (read-back {:.1} ms in all)", self.read_ms);
+        eprintln!("live: stream closed (render thread waited {:.1} ms for a free buffer; the writer {:.1} ms for mappings)", self.wait_ms, map_wait);
         Ok(())
     }
 }
