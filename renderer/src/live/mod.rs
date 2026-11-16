@@ -407,6 +407,10 @@ pub struct LiveCore {
     guard_read: Option<(wgpu::Buffer, Arc<AtomicU32>)>,
     /// known-future: material indices found for `set_emissive`, by the emission they were matched on.
     kf_emissive: std::collections::HashMap<String, Vec<usize>>,
+    /// known-future: what the live commands set on materials (the sharp flags' matches, each match's last emission),
+    /// set again after a rebuild, which reloads the materials from the scene.
+    kf_sharp_keys: Vec<[f32; 3]>,
+    kf_emis_last: Vec<([f32; 3], [f32; 3])>,
 }
 
 
@@ -576,7 +580,7 @@ impl LiveCore {
         // brings it, `gpu::loop_guard_of`.)
         let guard_read = (gpu::loop_guard_of(!g.hwrt).is_some() && targets.kernel.guard.is_some())
             .then(|| (g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("loop guard read"), size: 4, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), Arc::new(AtomicU32::new(0))));
-        let mut core = LiveCore { particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false,  pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, sky_cover: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read, kf_emissive: Default::default() };
+        let mut core = LiveCore { particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false,  pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, sky_cover: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read, kf_emissive: Default::default(), kf_sharp_keys: vec![], kf_emis_last: vec![] };
         core.spark_lights = core.sc.tables.emitter_tris.iter().any(|e| e.nominal);
         core.sky_cover = core.sc.tables.cloud_cover;
         core.apply_post(&pp);
@@ -642,6 +646,14 @@ impl LiveCore {
         self.pose_span = None;
         self.emitters_moved = false;
         self.lit_changed = self.frame.max(1);
+        // known-future: the materials are the scene's again: match them anew and set what the commands had set
+        self.kf_emissive.clear();
+        for k in self.kf_sharp_keys.clone() {
+            self.set_sharp(k);
+        }
+        for (k, rgb) in self.kf_emis_last.clone() {
+            self.set_emissive(k, rgb);
+        }
         Ok(())
     }
 
@@ -748,6 +760,9 @@ impl LiveCore {
 
     /// known-future: `Cmd::Sharp`, the MAT_KF_SHARP flag on the matched materials.
     pub fn set_sharp(&mut self, matched: [f32; 3]) -> usize {
+        if !self.kf_sharp_keys.contains(&matched) {
+            self.kf_sharp_keys.push(matched);
+        }
         let ids = self.kf_matched(matched);
         for &i in &ids {
             self.sc.tables.materials[i].tex1[2] |= KF_SHARP_FLAG;
@@ -759,6 +774,10 @@ impl LiveCore {
     }
 
     pub fn set_emissive(&mut self, matched: [f32; 3], rgb: [f32; 3]) -> usize {
+        match self.kf_emis_last.iter_mut().find(|e| e.0 == matched) {
+            Some(e) => e.1 = rgb,
+            None => self.kf_emis_last.push((matched, rgb)),
+        }
         let ids = self.kf_matched(matched);
         for &i in &ids {
             self.sc.tables.materials[i].emissive = [rgb[0], rgb[1], rgb[2], self.sc.tables.materials[i].emissive[3]];
