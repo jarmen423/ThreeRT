@@ -130,6 +130,10 @@ pub struct EmitterTri {
 /// An emitter triangle's power: area x emissive-factor luminance x object power (its CDF weight without light LOD).
 pub fn emitter_power(e: &EmitterTri, materials: &[scene::GpuMaterial], objects: &[[f32; 4]], stride: usize) -> f32 {
     let m = &materials[e.mat as usize];
+    // known-future: a material flagged not light-sampled (live/mod.rs KF_NO_NEE_FLAG) weighs nothing here: only rays find it
+    if m.tex1[2] & crate::live::KF_NO_NEE_FLAG != 0 {
+        return 0.0;
+    }
     let lum = 0.2126 * m.emissive[0] + 0.7152 * m.emissive[1] + 0.0722 * m.emissive[2];
     e.area * lum * objects.get(e.obj as usize * stride).map_or(1.0, |o| o[3])
 }

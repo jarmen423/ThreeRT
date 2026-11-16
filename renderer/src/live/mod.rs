@@ -93,6 +93,12 @@ pub struct LiveOpts {
 /// known-future: pathtrace.wgsl MAT_KF_SHARP, a bit of a material's flags (`tex1[2]`).
 pub const KF_SHARP_FLAG: i32 = 8;
 
+/// known-future: pathtrace.wgsl MAT_KF_NO_NEE, a material's emission found by rays alone (no emitter sampling, MIS weight
+/// 1): a large, near, mostly dark textured emitter (the laptop screen) is weighed by its untextured strength, so its
+/// rare light samples are huge and the firefly clamp cuts them; a glossy surface facing it then reflects almost none of
+/// it. THREERT_KF_SCREEN_NO_NEE=1 sets it with the sharp flag.
+pub const KF_NO_NEE_FLAG: i32 = 16;
+
 /// known-future: THREERT_KF_SHARP=1 sizes the direct buffer for `kf_sharp`'s output-resolution emission and runs it.
 pub fn kf_sharp_env() -> bool {
     std::env::var("THREERT_KF_SHARP").is_ok_and(|v| v == "1")
@@ -767,11 +773,15 @@ impl LiveCore {
             self.kf_sharp_keys.push(matched);
         }
         let ids = self.kf_matched(matched);
+        let no_nee = std::env::var("THREERT_KF_SCREEN_NO_NEE").is_ok_and(|v| v == "1");
         for &i in &ids {
-            self.sc.tables.materials[i].tex1[2] |= KF_SHARP_FLAG;
+            self.sc.tables.materials[i].tex1[2] |= KF_SHARP_FLAG | if no_nee { KF_NO_NEE_FLAG } else { 0 };
         }
         if !ids.is_empty() {
             self.upload_materials();
+            if no_nee {
+                self.write_emitters();
+            }
         }
         ids.len()
     }

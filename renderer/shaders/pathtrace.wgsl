@@ -57,6 +57,8 @@ const MAT_UNLIT: i32 = 4;
 // resolution by `kf_sharp` after the trace, not traced at render scale and through the temporal upscaler (a laptop
 // screen playing a video: its own picture needs no sampling).
 const MAT_KF_SHARP: i32 = 8;
+// known-future: emission found by rays alone (live/mod.rs KF_NO_NEE_FLAG): not light-sampled, MIS weight 1.
+const MAT_KF_NO_NEE: i32 = 16;
 // Live (real-time) mode: write this frame's 1-spp sample + first-hit distance instead of accumulating.
 override LIVE: bool = false;
 // The live renderer's approximations (gpu::A_*; docs/RUNTIME.md "How live differs from offline"): what a live path
@@ -1674,6 +1676,7 @@ fn sun_disks(d: vec3<f32>, pdf: f32) -> vec3<f32> {
 fn emit_mis(hit: Hit, d: vec3<f32>, pdf: f32) -> f32 {
     // Procedural surfaces are not light-sampled (no emitter entries): the BSDF ray is the only estimator.
     if (is_proc(hit)) { return 1.0; }
+    if ((material_at(bitcast<u32>(attrs[hit.tri].uv.w)).tex1.z & MAT_KF_NO_NEE) != 0) { return 1.0; }
     if (lt_on()) {
         // The light tree's pmf where the ray left (the vertex that sampled emitters), per area of the hit triangle.
         if (P.counts.y == 0u) { return 1.0; }
